@@ -24,12 +24,7 @@ use crate::funcs::bose_einstein;
 /// entry.  The pushed quadruple `[band0, j, k, flat_idx]` and the
 /// flat_idx layout (`band0 * num_band^2 + j * num_band + k`) are
 /// unchanged; only the visit order differs.
-pub(crate) fn set_g_pos(
-    out: &mut Vec<[i64; 4]>,
-    g_zero: &[i8],
-    num_band0: usize,
-    num_band: usize,
-) {
+pub(crate) fn set_g_pos(out: &mut Vec<[i64; 4]>, g_zero: &[i8], num_band0: usize, num_band: usize) {
     out.clear();
     out.reserve(g_zero.len());
     for b0 in 0..num_band0 {

@@ -15,6 +15,7 @@ use crate::common::{matvec_di, MatD, Vec3D, Vec3I};
 /// epsilon-guarded branches as the live code path here.
 const THM_EPSILON: f64 = 1e-10;
 
+/// ```text
 ///      6-------7
 ///     /|      /|
 ///    / |     / |
@@ -33,7 +34,7 @@ const THM_EPSILON: f64 = 1e-10;
 ///  5: c + a      1, 4, 7
 ///  6: c + b      2, 4, 7
 ///  7: c + a + b  3, 5, 6
-
+/// ```
 const MAIN_DIAGONALS: [Vec3I; 4] = [
     [1, 1, 1],  // 0-7
     [-1, 1, 1], // 1-6
@@ -272,9 +273,7 @@ fn sort_omegas(v: &mut [f64; 4]) -> i64 {
     }
 
     if v[1] > v[2] {
-        let tmp = v[1];
-        v[1] = v[2];
-        v[2] = tmp;
+        v.swap(1, 2);
         if i == 4 {
             i = 2;
         }

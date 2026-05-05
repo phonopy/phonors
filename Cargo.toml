@@ -8,10 +8,23 @@ rust-version = "1.75"
 name = "phonors"
 crate-type = ["cdylib", "rlib"]
 
+[features]
+default = ["extension-module"]
+extension-module = ["pyo3/extension-module"]
+
 [dependencies]
-pyo3 = { version = "0.28", features = ["extension-module", "abi3-py310"] }
+pyo3 = { version = "0.28", features = ["abi3-py310"] }
 numpy = "0.28"
 rayon = "1"
+
+[lints.clippy]
+# Numeric kernels favour explicit `for i in 0..n` loops with multi-dimensional
+# indexing over iterator chains; readability outweighs the lint.
+needless_range_loop = "allow"
+# PyO3 / numpy bridge functions frequently exceed clippy's 7-argument heuristic.
+too_many_arguments = "allow"
+# Kernel return / scratch types are intentionally tuples of arrays.
+type_complexity = "allow"
 
 [profile.release]
 lto = "thin"
