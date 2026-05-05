@@ -122,7 +122,7 @@ pub fn integration_weight(
     } else {
         for ((mut iw_blocks, iwz), triplet) in per_triplet_iw
             .into_iter()
-            .zip(iwz_chunks.into_iter())
+            .zip(iwz_chunks)
             .zip(triplets.iter())
         {
             integration_weight_per_triplet_inner_par(
@@ -191,7 +191,7 @@ pub fn integration_weight_with_sigma(
     } else {
         for ((mut iw_blocks, iwz), triplet) in per_triplet_iw
             .into_iter()
-            .zip(iwz_chunks.into_iter())
+            .zip(iwz_chunks)
             .zip(triplets.iter())
         {
             integration_weight_with_sigma_per_triplet_inner_par(
