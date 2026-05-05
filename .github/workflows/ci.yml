@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  cargo:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+      - name: cargo clippy
+        env:
+          PYO3_PYTHON: ${{ env.pythonLocation }}/bin/python
+        run: cargo clippy --no-default-features --all-targets -- -D warnings
+      - name: cargo test
+        env:
+          PYO3_PYTHON: ${{ env.pythonLocation }}/bin/python
+          LD_LIBRARY_PATH: ${{ env.pythonLocation }}/lib
+        run: cargo test --no-default-features

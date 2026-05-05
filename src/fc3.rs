@@ -154,6 +154,7 @@ pub(crate) fn set_permutation_symmetry_fc3(fc3: &mut [f64], num_atom: usize) {
 /// * `t_type = 0`: swap dim 0 and dim 1
 /// * `t_type = 1`: swap dim 0 and dim 2
 /// * `t_type = 2`: swap dim 1 and dim 2
+///
 /// Other values are no-ops, matching `fc3_transpose_compact_fc3` in
 /// `c/fc3.c`.  Types 0 and 1 require symmetry information (`p2s`,
 /// `s2pp`, `nsym_list`, `perms`) because one of the swapped indices
@@ -719,7 +720,7 @@ mod tests {
         for i_a in 0..num_atom {
             for j_a in 0..num_atom {
                 let out_base = (i_a * num_atom + j_a) * 27;
-                let src_base = ((0 * num_atom + i_a) * num_atom + j_a) * 9;
+                let src_base = (i_a * num_atom + j_a) * 9;
                 for k in 0..3 {
                     for l in 0..3 {
                         for m in 0..3 {
@@ -741,7 +742,7 @@ mod tests {
         // Fill source (target index = 1) block of source = 0 with unique values.
         for i in 0..num_atom {
             for j in 0..num_atom {
-                let base = (0 * num_atom * num_atom + i * num_atom + j) * 27;
+                let base = (i * num_atom + j) * 27;
                 for k in 0..27 {
                     fc3[base + k] = (1000 * i + 100 * j + k) as f64;
                 }
@@ -752,8 +753,8 @@ mod tests {
         // Target slab must equal source slab.
         for i in 0..num_atom {
             for j in 0..num_atom {
-                let src = (0 * num_atom * num_atom + i * num_atom + j) * 27;
-                let tgt = (1 * num_atom * num_atom + i * num_atom + j) * 27;
+                let src = (i * num_atom + j) * 27;
+                let tgt = (num_atom * num_atom + i * num_atom + j) * 27;
                 for k in 0..27 {
                     assert!((fc3[tgt + k] - fc3[src + k]).abs() < 1e-15);
                 }

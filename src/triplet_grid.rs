@@ -170,7 +170,7 @@ fn bz_triplets_at_q_type1(
     tolerance: f64,
 ) {
     let bz_adrs0 = bz_grid_addresses[grid_point as usize];
-    let num_gp = (d_diag[0] * d_diag[1] * d_diag[2]) as i64;
+    let num_gp = d_diag[0] * d_diag[1] * d_diag[2];
     let num_bzgp = (num_gp * 8) as usize;
     let gp0_idx = grid_point as usize;
 
