@@ -1712,6 +1712,150 @@ fn py_dynamical_matrices_at_qpoints_gonze<'py>(
     Ok(())
 }
 
+/// Transform dynamical matrices at commensurate q-points back to real-
+/// space force constants.
+///
+/// Writes into ``fc`` (float64, shape ``(n_fc_dim0, num_satom, 3, 3)``
+/// where ``n_fc_dim0`` is ``num_patom`` for compact fc or ``num_satom``
+/// for full fc).  ``dm`` is complex128 with shape
+/// ``(n_q, num_band, num_band)`` (commensurate q-points stacked,
+/// ``num_band = num_patom * 3``).  ``comm_points`` are the
+/// ``n_q = num_satom / num_patom`` commensurate q-points in fractional
+/// coordinates.  ``fc_index_map[i]`` is the row index into ``fc`` for
+/// primitive-cell atom ``i`` (it is ``p2s_map[i]`` for full fc and
+/// ``i`` for compact fc); the map must be injective so the per-(i, j)
+/// output blocks are disjoint.
+#[pyfunction]
+#[pyo3(name = "transform_dynmat_to_fc")]
+#[allow(clippy::too_many_arguments)]
+fn py_transform_dynmat_to_fc<'py>(
+    py: Python<'py>,
+    mut fc: PyReadwriteArray4<'py, f64>,
+    dm: PyReadonlyArray3<'py, Complex64>,
+    comm_points: PyReadonlyArray2<'py, f64>,
+    svecs: PyReadonlyArray2<'py, f64>,
+    multi: PyReadonlyArray3<'py, i64>,
+    masses: PyReadonlyArray1<'py, f64>,
+    s2pp_map: PyReadonlyArray1<'py, i64>,
+    fc_index_map: PyReadonlyArray1<'py, i64>,
+) -> PyResult<()> {
+    let fc_shape = fc.shape();
+    let n_fc_dim0 = fc_shape[0];
+    let num_satom = fc_shape[1];
+    if fc_shape[2] != 3 || fc_shape[3] != 3 {
+        return Err(PyValueError::new_err(
+            "fc must have shape (n_fc_dim0, num_satom, 3, 3)",
+        ));
+    }
+    let dm_shape = dm.shape();
+    let n_q = dm_shape[0];
+    let num_band = dm_shape[1];
+    if dm_shape[2] != num_band {
+        return Err(PyValueError::new_err(
+            "dm must have shape (n_q, num_band, num_band)",
+        ));
+    }
+    if num_band % 3 != 0 {
+        return Err(PyValueError::new_err("dm num_band must be a multiple of 3"));
+    }
+    let num_patom = num_band / 3;
+    if num_patom * n_q != num_satom {
+        return Err(PyValueError::new_err(
+            "n_q (= dm.shape[0]) must equal num_satom / num_patom",
+        ));
+    }
+    if comm_points.shape() != [n_q, 3] {
+        return Err(PyValueError::new_err(
+            "comm_points must have shape (n_q, 3)",
+        ));
+    }
+    if multi.shape() != [num_satom, num_patom, 2] {
+        return Err(PyValueError::new_err(
+            "multi must have shape (num_satom, num_patom, 2)",
+        ));
+    }
+    if masses.shape() != [num_patom] {
+        return Err(PyValueError::new_err("masses must have shape (num_patom,)"));
+    }
+    if s2pp_map.shape() != [num_satom] {
+        return Err(PyValueError::new_err(
+            "s2pp_map must have shape (num_satom,)",
+        ));
+    }
+    if fc_index_map.shape() != [num_patom] {
+        return Err(PyValueError::new_err(
+            "fc_index_map must have shape (num_patom,)",
+        ));
+    }
+    if svecs.shape().len() != 2 || svecs.shape()[1] != 3 {
+        return Err(PyValueError::new_err("svecs must have shape (n, 3)"));
+    }
+    let _ = n_fc_dim0;
+
+    let dm_view = dm.as_array();
+    let dm_flat = dm_view
+        .as_slice()
+        .ok_or_else(|| PyValueError::new_err("dm must be C-contiguous"))?;
+    let dm_cmplx: &[Cmplx] = {
+        let n = dm_flat.len();
+        let ptr = dm_flat.as_ptr() as *const Cmplx;
+        unsafe { std::slice::from_raw_parts(ptr, n) }
+    };
+
+    let comm_view = comm_points.as_array();
+    let comm_flat = comm_view
+        .as_slice()
+        .ok_or_else(|| PyValueError::new_err("comm_points must be C-contiguous"))?;
+    let comm_slice: &[[f64; 3]] = group_as_array(comm_flat);
+
+    let svecs_view = svecs.as_array();
+    let svecs_flat = svecs_view
+        .as_slice()
+        .ok_or_else(|| PyValueError::new_err("svecs must be C-contiguous"))?;
+    let svecs_slice: &[[f64; 3]] = group_as_array(svecs_flat);
+
+    let multi_view = multi.as_array();
+    let multi_flat = multi_view
+        .as_slice()
+        .ok_or_else(|| PyValueError::new_err("multi must be C-contiguous"))?;
+    let multi_slice: &[[i64; 2]] = group_as_array(multi_flat);
+
+    let masses_view = masses.as_array();
+    let masses_slice = masses_view
+        .as_slice()
+        .ok_or_else(|| PyValueError::new_err("masses must be C-contiguous"))?;
+
+    let s2pp_view = s2pp_map.as_array();
+    let s2pp_slice = s2pp_view
+        .as_slice()
+        .ok_or_else(|| PyValueError::new_err("s2pp_map must be C-contiguous"))?;
+
+    let fc_idx_view = fc_index_map.as_array();
+    let fc_idx_slice = fc_idx_view
+        .as_slice()
+        .ok_or_else(|| PyValueError::new_err("fc_index_map must be C-contiguous"))?;
+
+    let fc_slice = fc
+        .as_slice_mut()
+        .map_err(|_| PyValueError::new_err("fc must be C-contiguous"))?;
+
+    py.detach(|| {
+        dynmat::transform_dynmat_to_fc(
+            fc_slice,
+            dm_cmplx,
+            comm_slice,
+            svecs_slice,
+            multi_slice,
+            masses_slice,
+            s2pp_slice,
+            fc_idx_slice,
+            num_patom,
+            num_satom,
+        );
+    });
+    Ok(())
+}
+
 /// Transform fc3 from real space to reciprocal space at a q-triplet.
 ///
 /// Writes into ``fc3_reciprocal`` (complex128, shape
@@ -5407,6 +5551,7 @@ fn phonors(m: &Bound<'_, PyModule>) -> PyResult<()> {
     )?)?;
     m.add_function(wrap_pyfunction!(py_dynamical_matrices_at_qpoints, m)?)?;
     m.add_function(wrap_pyfunction!(py_dynamical_matrices_at_qpoints_gonze, m)?)?;
+    m.add_function(wrap_pyfunction!(py_transform_dynmat_to_fc, m)?)?;
     m.add_function(wrap_pyfunction!(py_real_to_reciprocal, m)?)?;
     m.add_function(wrap_pyfunction!(py_reciprocal_to_normal_squared, m)?)?;
     m.add_function(wrap_pyfunction!(py_imag_self_energy_with_g, m)?)?;
