@@ -14,6 +14,7 @@ mod bzgrid;
 mod cells;
 mod collision_matrix;
 mod common;
+mod derivative_dynmat;
 mod dynmat;
 mod fc2;
 mod fc3;
@@ -1707,6 +1708,175 @@ fn py_dynamical_matrices_at_qpoints_gonze<'py>(
             num_satom,
             &gonze,
             hermitianize,
+        );
+    });
+    Ok(())
+}
+
+/// Build the analytical derivative of the dynamical matrix at a
+/// single q-point.
+///
+/// Writes into ``ddm`` (complex128, shape ``(3, num_band, num_band)``);
+/// the leading axis is the cartesian derivative direction.  ``fc``
+/// is float64 with shape ``(num_patom or num_satom, num_satom, 3, 3)``;
+/// ``fc_row_map`` is ``primitive.p2s_map`` for full fc and
+/// ``arange(num_patom)`` for compact fc.  Wang-NAC contributions are
+/// added when ``born`` and ``dielectric`` are provided.
+#[pyfunction]
+#[pyo3(name = "derivative_dynmat_at_q")]
+#[pyo3(signature = (
+    ddm, fc, q, lattice, reclat, svecs, multi, mass, s2p_map, fc_row_map,
+    born=None, dielectric=None, q_direction=None, nac_factor=0.0,
+))]
+#[allow(clippy::too_many_arguments)]
+fn py_derivative_dynmat_at_q<'py>(
+    py: Python<'py>,
+    mut ddm: PyReadwriteArray3<'py, Complex64>,
+    fc: PyReadonlyArray4<'py, f64>,
+    q: PyReadonlyArray1<'py, f64>,
+    lattice: PyReadonlyArray2<'py, f64>,
+    reclat: PyReadonlyArray2<'py, f64>,
+    svecs: PyReadonlyArray2<'py, f64>,
+    multi: PyReadonlyArray3<'py, i64>,
+    mass: PyReadonlyArray1<'py, f64>,
+    s2p_map: PyReadonlyArray1<'py, i64>,
+    fc_row_map: PyReadonlyArray1<'py, i64>,
+    born: Option<PyReadonlyArray3<'py, f64>>,
+    dielectric: Option<PyReadonlyArray2<'py, f64>>,
+    q_direction: Option<PyReadonlyArray1<'py, f64>>,
+    nac_factor: f64,
+) -> PyResult<()> {
+    let ddm_shape = ddm.shape();
+    if ddm_shape.len() != 3 || ddm_shape[0] != 3 || ddm_shape[1] != ddm_shape[2] {
+        return Err(PyValueError::new_err(
+            "ddm must have shape (3, num_band, num_band)",
+        ));
+    }
+    let num_band = ddm_shape[1];
+    if num_band % 3 != 0 {
+        return Err(PyValueError::new_err("num_band must be a multiple of 3"));
+    }
+    let num_patom = num_band / 3;
+    let num_satom = s2p_map.shape()[0];
+    let fc_shape = fc.shape();
+    if fc_shape[1] != num_satom
+        || fc_shape[2] != 3
+        || fc_shape[3] != 3
+        || (fc_shape[0] != num_patom && fc_shape[0] != num_satom)
+    {
+        return Err(PyValueError::new_err(
+            "fc must have shape (num_patom or num_satom, num_satom, 3, 3)",
+        ));
+    }
+    if q.shape() != [3] {
+        return Err(PyValueError::new_err("q must have shape (3,)"));
+    }
+    if multi.shape() != [num_satom, num_patom, 2] {
+        return Err(PyValueError::new_err(
+            "multi must have shape (num_satom, num_patom, 2)",
+        ));
+    }
+    if mass.shape() != [num_patom] {
+        return Err(PyValueError::new_err("mass must have shape (num_patom,)"));
+    }
+    if fc_row_map.shape() != [num_patom] {
+        return Err(PyValueError::new_err(
+            "fc_row_map must have shape (num_patom,)",
+        ));
+    }
+    if svecs.shape().len() != 2 || svecs.shape()[1] != 3 {
+        return Err(PyValueError::new_err("svecs must have shape (n, 3)"));
+    }
+
+    let lat = mat3_f(&lattice)?;
+    let rec = mat3_f(&reclat)?;
+    let q_view = q.as_array();
+    let q3 = [q_view[0], q_view[1], q_view[2]];
+
+    let fc_view = fc.as_array();
+    let fc_slice = fc_view
+        .as_slice()
+        .ok_or_else(|| PyValueError::new_err("fc must be C-contiguous"))?;
+    let svecs_view = svecs.as_array();
+    let svecs_flat = svecs_view
+        .as_slice()
+        .ok_or_else(|| PyValueError::new_err("svecs must be C-contiguous"))?;
+    let svecs_slice: &[[f64; 3]] = group_as_array(svecs_flat);
+    let multi_view = multi.as_array();
+    let multi_flat = multi_view
+        .as_slice()
+        .ok_or_else(|| PyValueError::new_err("multi must be C-contiguous"))?;
+    let multi_slice: &[[i64; 2]] = group_as_array(multi_flat);
+    let mass_view = mass.as_array();
+    let mass_slice = mass_view
+        .as_slice()
+        .ok_or_else(|| PyValueError::new_err("mass must be C-contiguous"))?;
+    let s2p_view = s2p_map.as_array();
+    let s2p_slice = s2p_view
+        .as_slice()
+        .ok_or_else(|| PyValueError::new_err("s2p_map must be C-contiguous"))?;
+    let fc_row_view = fc_row_map.as_array();
+    let fc_row_slice = fc_row_view
+        .as_slice()
+        .ok_or_else(|| PyValueError::new_err("fc_row_map must be C-contiguous"))?;
+
+    let born_view;
+    let nac = match born.as_ref() {
+        None => None,
+        Some(b) => {
+            let diel_arr = dielectric.as_ref().ok_or_else(|| {
+                PyValueError::new_err("dielectric must be provided when born is given")
+            })?;
+            if b.shape() != [num_patom, 3, 3] {
+                return Err(PyValueError::new_err(
+                    "born must have shape (num_patom, 3, 3)",
+                ));
+            }
+            let diel = mat3_f(diel_arr)?;
+            born_view = b.as_array();
+            let born_flat = born_view
+                .as_slice()
+                .ok_or_else(|| PyValueError::new_err("born must be C-contiguous"))?;
+            let born_slice: &[[[f64; 3]; 3]] = group_as_array_2d::<f64, 3, 3>(born_flat);
+            let qd: Option<[f64; 3]> = match q_direction.as_ref() {
+                None => None,
+                Some(arr) => {
+                    if arr.shape() != [3] {
+                        return Err(PyValueError::new_err("q_direction must have shape (3,)"));
+                    }
+                    let v = arr.as_array();
+                    Some([v[0], v[1], v[2]])
+                }
+            };
+            Some(derivative_dynmat::DerivativeNacParams {
+                born: born_slice,
+                dielectric: diel,
+                q_direction: qd,
+                nac_factor,
+            })
+        }
+    };
+
+    let ddm_slice = ddm
+        .as_slice_mut()
+        .map_err(|_| PyValueError::new_err("ddm must be C-contiguous"))?;
+    let ddm_cmplx = complex_as_cmplx_mut(ddm_slice);
+
+    py.detach(|| {
+        derivative_dynmat::derivative_dynmat_at_q(
+            ddm_cmplx,
+            fc_slice,
+            q3,
+            &lat,
+            &rec,
+            svecs_slice,
+            multi_slice,
+            mass_slice,
+            s2p_slice,
+            fc_row_slice,
+            nac.as_ref(),
+            num_patom,
+            num_satom,
         );
     });
     Ok(())
@@ -5552,6 +5722,7 @@ fn phonors(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_dynamical_matrices_at_qpoints, m)?)?;
     m.add_function(wrap_pyfunction!(py_dynamical_matrices_at_qpoints_gonze, m)?)?;
     m.add_function(wrap_pyfunction!(py_transform_dynmat_to_fc, m)?)?;
+    m.add_function(wrap_pyfunction!(py_derivative_dynmat_at_q, m)?)?;
     m.add_function(wrap_pyfunction!(py_real_to_reciprocal, m)?)?;
     m.add_function(wrap_pyfunction!(py_reciprocal_to_normal_squared, m)?)?;
     m.add_function(wrap_pyfunction!(py_imag_self_energy_with_g, m)?)?;
