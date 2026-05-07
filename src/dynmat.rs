@@ -43,6 +43,7 @@ pub fn get_dynamical_matrix_at_q(
     charge_sum: Option<&[[[f64; 3]; 3]]>,
     num_patom: usize,
     num_satom: usize,
+    hermitianize: bool,
 ) {
     let num_band = num_patom * 3;
     debug_assert_eq!(dynamical_matrix.len(), num_band * num_band);
@@ -74,7 +75,9 @@ pub fn get_dynamical_matrix_at_q(
         }
     }
 
-    make_hermitian(dynamical_matrix, num_band);
+    if hermitianize {
+        make_hermitian(dynamical_matrix, num_band);
+    }
 }
 
 /// Fill the 3x3 block at primitive-atom pair `(i, j)`.  Mirrors
@@ -259,23 +262,30 @@ fn get_dd(
     dielectric: &MatD,
     pos: &[Vec3D],
     lambda: f64,
-    tolerance: f64,
 ) {
     let l2 = 4.0 * lambda * lambda;
     let mut kk: Vec<MatD> = vec![[[0.0; 3]; 3]; g_list.len()];
+    // PRECONDITION: `q_cart` is the cartesian image of a q-point inside
+    // the first Brillouin zone.  Under that assumption the
+    // `K = G + q_cart ≈ 0` special case can only fire when both
+    // q_cart is at Gamma and G = 0 (any non-zero G has cartesian norm
+    // well above the tolerance, and q_cart cannot sit on a non-zero
+    // reciprocal lattice vector while being inside the first BZ).
+    // We therefore hoist the q-at-Gamma check, skipping the per-G
+    // norm computation and branch on the common (q != Gamma) path.
+    //
+    // If a caller ever feeds a q outside the first BZ that happens to
+    // satisfy q + G = 0 for some G in `g_list`, the non-Gamma branch
+    // below will divide by zero (`dpart = 0`).  Phonopy does not
+    // strictly enforce the first-BZ precondition today; phono3py does.
+    // Revisit this when the precondition is broken in practice.
+    let q_at_gamma = at_gamma_continuous(q_cart);
     for (g, kk_g) in g_list.iter().zip(kk.iter_mut()) {
-        let mut q_k = [0.0; 3];
-        let mut norm = 0.0;
-        for i in 0..3 {
-            q_k[i] = g[i] + q_cart[i];
-            norm += q_k[i] * q_k[i];
-        }
-        if norm.sqrt() < tolerance {
-            match q_direction_cart {
-                None => {
-                    // already zero
-                }
-                Some(qd) => {
+        let q_k = [g[0] + q_cart[0], g[1] + q_cart[1], g[2] + q_cart[2]];
+        if q_at_gamma {
+            let norm = q_k[0] * q_k[0] + q_k[1] * q_k[1] + q_k[2] * q_k[2];
+            if norm < Q2_ZERO_TOLERANCE {
+                if let Some(qd) = q_direction_cart {
                     let dpart = dielectric_part(qd, dielectric);
                     for i in 0..3 {
                         for j in 0..3 {
@@ -283,14 +293,15 @@ fn get_dd(
                         }
                     }
                 }
+                // q_direction_cart == None leaves kk_g at zero.
+                continue;
             }
-        } else {
-            let dpart = dielectric_part(q_k, dielectric);
-            let damp = (-dpart / l2).exp();
-            for i in 0..3 {
-                for j in 0..3 {
-                    kk_g[i][j] = q_k[i] * q_k[j] / dpart * damp;
-                }
+        }
+        let dpart = dielectric_part(q_k, dielectric);
+        let damp = (-dpart / l2).exp();
+        for i in 0..3 {
+            for j in 0..3 {
+                kk_g[i][j] = q_k[i] * q_k[j] / dpart * damp;
             }
         }
     }
@@ -364,7 +375,6 @@ pub fn get_recip_dipole_dipole_q0(
     dielectric: &MatD,
     pos: &[Vec3D],
     lambda: f64,
-    tolerance: f64,
 ) {
     debug_assert_eq!(dd_q0.len(), num_patom * 9);
     debug_assert_eq!(born.len(), num_patom);
@@ -384,7 +394,6 @@ pub fn get_recip_dipole_dipole_q0(
         dielectric,
         pos,
         lambda,
-        tolerance,
     );
 
     multiply_borns(&mut dd_tmp2, &dd_tmp1, num_patom, born);
@@ -445,7 +454,6 @@ pub fn get_recip_dipole_dipole(
     pos: &[Vec3D],
     factor: f64,
     lambda: f64,
-    tolerance: f64,
 ) {
     let n2 = num_patom * num_patom * 9;
     debug_assert_eq!(dd.len(), n2);
@@ -467,7 +475,6 @@ pub fn get_recip_dipole_dipole(
         dielectric,
         pos,
         lambda,
-        tolerance,
     );
 
     multiply_borns(dd, &dd_tmp, num_patom, born);
@@ -538,17 +545,35 @@ pub struct GonzeNacParams<'a> {
 }
 
 /// Decide whether the NAC contribution must be applied at this
-/// grid point.  Mirrors `needs_nac` in `c/phonon.c`: no `born`
-/// means no NAC; otherwise NAC is applied unless we are at
-/// Gamma with no q-direction set.
-fn needs_nac(has_born: bool, grid_address: Vec3I, has_q_direction: bool) -> bool {
+/// q-point.  Mirrors `needs_nac` in `c/phonon.c`: no `born` means no
+/// NAC; otherwise NAC is applied unless the q-point is at Gamma with
+/// no q-direction set.  `at_gamma` is true when the q-point coincides
+/// with the Gamma point (exact integer grid address [0, 0, 0] or a
+/// continuous q within tolerance of zero, depending on the caller).
+fn needs_nac(has_born: bool, at_gamma: bool, has_q_direction: bool) -> bool {
     if !has_born {
         return false;
     }
-    if !has_q_direction && grid_address == [0, 0, 0] {
+    if !has_q_direction && at_gamma {
         return false;
     }
     true
+}
+
+/// Squared-norm tolerance on the cartesian q-vector used to decide
+/// whether a q-point sits at Gamma.  Equivalent to `|q_cart| < 1e-5`
+/// but compared against the squared norm so the per-call `sqrt` is
+/// avoided (sqrt is monotone, so the two predicates agree on every
+/// non-NaN input).  Used both by `at_gamma_continuous` and inside
+/// `get_dd` for the K=0 special case in the dipole-dipole sum.
+const Q2_ZERO_TOLERANCE: f64 = 1e-10;
+
+/// True when the squared cartesian norm of the q-point is below
+/// `Q2_ZERO_TOLERANCE` (i.e. the q-point coincides with Gamma to
+/// within the algorithmic guard).
+fn at_gamma_continuous(q_cart: Vec3D) -> bool {
+    let n2 = q_cart[0] * q_cart[0] + q_cart[1] * q_cart[1] + q_cart[2] * q_cart[2];
+    n2 < Q2_ZERO_TOLERANCE
 }
 
 /// Wang-NAC charge-sum with the dielectric/supercell-ratio factor
@@ -569,11 +594,16 @@ fn wang_charge_sum_with_factor(
 
 /// Build the Wang- or no-NAC dynamical matrix at a single q-point.
 /// Mirrors `get_dynamical_matrix` (static) in `c/phonon.c`.
+///
+/// `at_gamma` is the Gamma-point flag used by `needs_nac`; the caller
+/// chooses how to derive it (exact integer grid-address comparison for
+/// the mesh path, tolerance-based check for the continuous-q path).
+/// `hermitianize` controls the final Hermitization pass.
 #[allow(clippy::too_many_arguments)]
 fn build_dm_with_wang_nac_at_q(
     dm: &mut [Cmplx],
     q: Vec3D,
-    grid_address: Vec3I,
+    at_gamma: bool,
     fc: &[f64],
     svecs: &[Vec3D],
     multi: &[[i64; 2]],
@@ -583,10 +613,11 @@ fn build_dm_with_wang_nac_at_q(
     num_patom: usize,
     num_satom: usize,
     wang: Option<&WangNacParams>,
+    hermitianize: bool,
 ) {
     let is_nac = match wang {
         None => false,
-        Some(p) => needs_nac(true, grid_address, p.q_direction.is_some()),
+        Some(p) => needs_nac(true, at_gamma, p.q_direction.is_some()),
     };
     if is_nac {
         let params = wang.unwrap();
@@ -604,10 +635,22 @@ fn build_dm_with_wang_nac_at_q(
             Some(&charge_sum),
             num_patom,
             num_satom,
+            hermitianize,
         );
     } else {
         get_dynamical_matrix_at_q(
-            dm, fc, q, svecs, multi, mass, s2p_map, p2s_map, None, num_patom, num_satom,
+            dm,
+            fc,
+            q,
+            svecs,
+            multi,
+            mass,
+            s2p_map,
+            p2s_map,
+            None,
+            num_patom,
+            num_satom,
+            hermitianize,
         );
     }
 }
@@ -629,9 +672,21 @@ fn build_dm_with_gonze_nac_at_q(
     num_patom: usize,
     num_satom: usize,
     gonze: &GonzeNacParams,
+    hermitianize: bool,
 ) {
     get_dynamical_matrix_at_q(
-        dm, fc, q, svecs, multi, mass, s2p_map, p2s_map, None, num_patom, num_satom,
+        dm,
+        fc,
+        q,
+        svecs,
+        multi,
+        mass,
+        s2p_map,
+        p2s_map,
+        None,
+        num_patom,
+        num_satom,
+        hermitianize,
     );
 
     let q_cart = matvec_dd(&gonze.reciprocal_lattice, q);
@@ -652,7 +707,6 @@ fn build_dm_with_gonze_nac_at_q(
         gonze.pos,
         gonze.nac_factor,
         gonze.lambda,
-        1e-5,
     );
 
     let stride = num_patom * 3;
@@ -748,7 +802,7 @@ pub fn dynamical_matrices_at_gridpoints(
         build_dm_with_wang_nac_at_q(
             dm,
             q,
-            grid_address,
+            grid_address == [0, 0, 0],
             fc,
             svecs,
             multi,
@@ -758,6 +812,7 @@ pub fn dynamical_matrices_at_gridpoints(
             num_patom,
             num_satom,
             wang,
+            true,
         );
     });
 }
@@ -789,9 +844,106 @@ pub fn dynamical_matrices_at_gridpoints_gonze(
     chunks.into_par_iter().for_each(|(gp, dm)| {
         let q = matvec_di(qd_inv, grid_addresses[gp]);
         build_dm_with_gonze_nac_at_q(
-            dm, q, fc, svecs, multi, mass, s2p_map, p2s_map, num_patom, num_satom, gonze,
+            dm, q, fc, svecs, multi, mass, s2p_map, p2s_map, num_patom, num_satom, gonze, true,
         );
     });
+}
+
+/// Build dynamical matrices at the listed arbitrary q-points (Wang
+/// or no-NAC path).  Parallel over q-points with rayon.  Mirrors the
+/// `use_Wang_NAC` and `dd_q0 == NULL` branches of
+/// `dym_dynamical_matrices_with_dd_openmp_over_qpoints` in
+/// `c/dynmat.c`.
+///
+/// `dynmats` has length `n_qpoints * num_band^2` packed in C order.
+/// Pass `wang = Some(...)` for Wang NAC, `wang = None` for no NAC.
+/// Set `hermitianize = true` to apply the per-qpoint Hermitization
+/// pass (matches the C `hermitianize` flag).
+#[allow(clippy::too_many_arguments)]
+pub fn dynamical_matrices_at_qpoints(
+    dynmats: &mut [Cmplx],
+    qpoints: &[Vec3D],
+    fc: &[f64],
+    svecs: &[Vec3D],
+    multi: &[[i64; 2]],
+    mass: &[f64],
+    p2s_map: &[i64],
+    s2p_map: &[i64],
+    num_patom: usize,
+    num_satom: usize,
+    wang: Option<&WangNacParams>,
+    hermitianize: bool,
+) {
+    let num_band = num_patom * 3;
+    let stride = num_band * num_band;
+    debug_assert_eq!(dynmats.len(), qpoints.len() * stride);
+    dynmats
+        .par_chunks_mut(stride)
+        .zip(qpoints.par_iter())
+        .for_each(|(dm, &q)| {
+            let q_cart = wang
+                .map(|w| matvec_dd(&w.reciprocal_lattice, q))
+                .unwrap_or([0.0; 3]);
+            let at_gamma = at_gamma_continuous(q_cart);
+            build_dm_with_wang_nac_at_q(
+                dm,
+                q,
+                at_gamma,
+                fc,
+                svecs,
+                multi,
+                mass,
+                s2p_map,
+                p2s_map,
+                num_patom,
+                num_satom,
+                wang,
+                hermitianize,
+            );
+        });
+}
+
+/// Build dynamical matrices at the listed arbitrary q-points (Gonze-
+/// Lee NAC path).  Parallel over q-points with rayon.  Mirrors the
+/// `dd_q0 != NULL` branch of
+/// `dym_dynamical_matrices_with_dd_openmp_over_qpoints`.
+#[allow(clippy::too_many_arguments)]
+pub fn dynamical_matrices_at_qpoints_gonze(
+    dynmats: &mut [Cmplx],
+    qpoints: &[Vec3D],
+    fc: &[f64],
+    svecs: &[Vec3D],
+    multi: &[[i64; 2]],
+    mass: &[f64],
+    p2s_map: &[i64],
+    s2p_map: &[i64],
+    num_patom: usize,
+    num_satom: usize,
+    gonze: &GonzeNacParams,
+    hermitianize: bool,
+) {
+    let num_band = num_patom * 3;
+    let stride = num_band * num_band;
+    debug_assert_eq!(dynmats.len(), qpoints.len() * stride);
+    dynmats
+        .par_chunks_mut(stride)
+        .zip(qpoints.par_iter())
+        .for_each(|(dm, &q)| {
+            build_dm_with_gonze_nac_at_q(
+                dm,
+                q,
+                fc,
+                svecs,
+                multi,
+                mass,
+                s2p_map,
+                p2s_map,
+                num_patom,
+                num_satom,
+                gonze,
+                hermitianize,
+            );
+        });
 }
 
 #[cfg(test)]
@@ -882,6 +1034,7 @@ mod tests {
             None,
             num_patom,
             num_satom,
+            true,
         );
 
         for k in 0..3 {
