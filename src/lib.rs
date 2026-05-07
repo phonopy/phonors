@@ -11,9 +11,11 @@ use pyo3::prelude::*;
 use crate::common::Cmplx;
 
 mod bzgrid;
+mod cells;
 mod collision_matrix;
 mod common;
 mod dynmat;
+mod fc2;
 mod fc3;
 mod funcs;
 mod grgrid;
@@ -4707,6 +4709,322 @@ fn py_tetrahedra_relative_grid_address<'py>(
     Ok(())
 }
 
+#[pyfunction]
+#[pyo3(name = "compute_permutation")]
+fn py_compute_permutation<'py>(
+    py: Python<'py>,
+    mut permutation: PyReadwriteArray1<'py, i64>,
+    lattice: PyReadonlyArray2<'py, f64>,
+    positions: PyReadonlyArray2<'py, f64>,
+    rotated_positions: PyReadonlyArray2<'py, f64>,
+    symprec: f64,
+) -> PyResult<bool> {
+    let pos_shape = positions.shape();
+    let num_pos = pos_shape[0];
+    if pos_shape[1] != 3 {
+        return Err(PyValueError::new_err(
+            "positions must have shape (num_pos, 3)",
+        ));
+    }
+    let rp_shape = rotated_positions.shape();
+    if rp_shape != [num_pos, 3] {
+        return Err(PyValueError::new_err(
+            "rotated_positions must match positions shape",
+        ));
+    }
+    if permutation.shape() != [num_pos] {
+        return Err(PyValueError::new_err(
+            "permutation must have shape (num_pos,)",
+        ));
+    }
+
+    let lat = mat3_f(&lattice)?;
+    let lat_flat = [
+        lat[0][0], lat[0][1], lat[0][2], lat[1][0], lat[1][1], lat[1][2], lat[2][0], lat[2][1],
+        lat[2][2],
+    ];
+
+    let pos_view = positions.as_array();
+    let pos_slice = pos_view
+        .as_slice()
+        .ok_or_else(|| PyValueError::new_err("positions must be C-contiguous"))?;
+    let rp_view = rotated_positions.as_array();
+    let rp_slice = rp_view
+        .as_slice()
+        .ok_or_else(|| PyValueError::new_err("rotated_positions must be C-contiguous"))?;
+    let perm_slice = permutation
+        .as_slice_mut()
+        .map_err(|_| PyValueError::new_err("permutation must be C-contiguous"))?;
+
+    let ok = py.detach(|| {
+        cells::compute_permutation(perm_slice, &lat_flat, pos_slice, rp_slice, num_pos, symprec)
+    });
+    Ok(ok)
+}
+
+#[pyfunction]
+#[pyo3(name = "perm_trans_symmetrize_fc")]
+fn py_perm_trans_symmetrize_fc<'py>(
+    py: Python<'py>,
+    mut force_constants: PyReadwriteArray4<'py, f64>,
+    level: i64,
+) -> PyResult<()> {
+    let shape = force_constants.shape();
+    let n_satom = shape[0];
+    if shape[1] != n_satom || shape[2] != 3 || shape[3] != 3 {
+        return Err(PyValueError::new_err(
+            "force_constants must have shape (n_satom, n_satom, 3, 3)",
+        ));
+    }
+    if level < 0 {
+        return Err(PyValueError::new_err("level must be non-negative"));
+    }
+    let fc_slice = force_constants
+        .as_slice_mut()
+        .map_err(|_| PyValueError::new_err("force_constants must be C-contiguous"))?;
+    py.detach(|| {
+        fc2::perm_trans_symmetrize_fc(fc_slice, n_satom, level as usize);
+    });
+    Ok(())
+}
+
+/// Validate the array shapes and contiguity that
+/// `set_index_permutation_symmetry_compact_fc` requires.  Returns
+/// `(n_patom, n_satom)` on success.
+fn check_compact_fc_arrays(
+    force_constants_shape: &[usize],
+    permutations_shape: &[usize],
+    s2pp_shape: &[usize],
+    p2s_shape: &[usize],
+    nsym_list_shape: &[usize],
+) -> PyResult<(usize, usize)> {
+    let n_patom = force_constants_shape[0];
+    let n_satom = force_constants_shape[1];
+    if force_constants_shape[2] != 3 || force_constants_shape[3] != 3 {
+        return Err(PyValueError::new_err(
+            "force_constants must have shape (n_patom, n_satom, 3, 3)",
+        ));
+    }
+    if permutations_shape[1] != n_satom {
+        return Err(PyValueError::new_err(
+            "permutations must have shape (n_sym, n_satom)",
+        ));
+    }
+    if s2pp_shape != [n_satom] {
+        return Err(PyValueError::new_err("s2pp_map must have shape (n_satom,)"));
+    }
+    if p2s_shape != [n_patom] {
+        return Err(PyValueError::new_err("p2s_map must have shape (n_patom,)"));
+    }
+    if nsym_list_shape != [n_satom] {
+        return Err(PyValueError::new_err(
+            "nsym_list must have shape (n_satom,)",
+        ));
+    }
+    Ok((n_patom, n_satom))
+}
+
+#[pyfunction]
+#[pyo3(name = "transpose_compact_fc")]
+fn py_transpose_compact_fc<'py>(
+    py: Python<'py>,
+    mut force_constants: PyReadwriteArray4<'py, f64>,
+    permutations: PyReadonlyArray2<'py, i64>,
+    s2pp_map: PyReadonlyArray1<'py, i64>,
+    p2s_map: PyReadonlyArray1<'py, i64>,
+    nsym_list: PyReadonlyArray1<'py, i64>,
+) -> PyResult<()> {
+    let (n_patom, n_satom) = check_compact_fc_arrays(
+        force_constants.shape(),
+        permutations.shape(),
+        s2pp_map.shape(),
+        p2s_map.shape(),
+        nsym_list.shape(),
+    )?;
+    let perms_view = permutations.as_array();
+    let perms_slice = perms_view
+        .as_slice()
+        .ok_or_else(|| PyValueError::new_err("permutations must be C-contiguous"))?;
+    let s2pp_view = s2pp_map.as_array();
+    let s2pp_slice = s2pp_view
+        .as_slice()
+        .ok_or_else(|| PyValueError::new_err("s2pp_map must be C-contiguous"))?;
+    let p2s_view = p2s_map.as_array();
+    let p2s_slice = p2s_view
+        .as_slice()
+        .ok_or_else(|| PyValueError::new_err("p2s_map must be C-contiguous"))?;
+    let nsym_view = nsym_list.as_array();
+    let nsym_slice = nsym_view
+        .as_slice()
+        .ok_or_else(|| PyValueError::new_err("nsym_list must be C-contiguous"))?;
+    let fc_slice = force_constants
+        .as_slice_mut()
+        .map_err(|_| PyValueError::new_err("force_constants must be C-contiguous"))?;
+    py.detach(|| {
+        fc2::set_index_permutation_symmetry_compact_fc(
+            fc_slice,
+            p2s_slice,
+            s2pp_slice,
+            nsym_slice,
+            perms_slice,
+            n_satom,
+            n_patom,
+            true,
+        );
+    });
+    Ok(())
+}
+
+#[pyfunction]
+#[pyo3(name = "distribute_fc2")]
+fn py_distribute_fc2<'py>(
+    py: Python<'py>,
+    mut force_constants: PyReadwriteArray4<'py, f64>,
+    atom_list: PyReadonlyArray1<'py, i64>,
+    fc_indices_of_atom_list: PyReadonlyArray1<'py, i64>,
+    rotations_cart: PyReadonlyArray3<'py, f64>,
+    permutations: PyReadonlyArray2<'py, i64>,
+    map_atoms: PyReadonlyArray1<'py, i64>,
+    map_syms: PyReadonlyArray1<'py, i64>,
+) -> PyResult<()> {
+    let fc_shape = force_constants.shape();
+    if fc_shape.len() != 4 || fc_shape[2] != 3 || fc_shape[3] != 3 {
+        return Err(PyValueError::new_err(
+            "force_constants must have shape (fc_dim0, num_pos, 3, 3)",
+        ));
+    }
+    let fc_dim0 = fc_shape[0];
+    let num_pos = fc_shape[1];
+
+    let perm_shape = permutations.shape();
+    if perm_shape.len() != 2 || perm_shape[1] != num_pos {
+        return Err(PyValueError::new_err(
+            "permutations must have shape (num_rot, num_pos)",
+        ));
+    }
+    let num_rot = perm_shape[0];
+
+    let r_shape = rotations_cart.shape();
+    if r_shape != [num_rot, 3, 3] {
+        return Err(PyValueError::new_err(
+            "rotations_cart must have shape (num_rot, 3, 3)",
+        ));
+    }
+
+    let len_atom_list = atom_list.shape()[0];
+    if fc_indices_of_atom_list.shape() != [len_atom_list] {
+        return Err(PyValueError::new_err(
+            "fc_indices_of_atom_list must match atom_list length",
+        ));
+    }
+    if map_atoms.shape() != [num_pos] {
+        return Err(PyValueError::new_err(
+            "map_atoms must have shape (num_pos,)",
+        ));
+    }
+    if map_syms.shape() != [num_pos] {
+        return Err(PyValueError::new_err("map_syms must have shape (num_pos,)"));
+    }
+    let _ = fc_dim0;
+
+    let atom_view = atom_list.as_array();
+    let atom_slice = atom_view
+        .as_slice()
+        .ok_or_else(|| PyValueError::new_err("atom_list must be C-contiguous"))?;
+    let fc_idx_view = fc_indices_of_atom_list.as_array();
+    let fc_idx_slice = fc_idx_view
+        .as_slice()
+        .ok_or_else(|| PyValueError::new_err("fc_indices_of_atom_list must be C-contiguous"))?;
+    let r_view = rotations_cart.as_array();
+    let r_slice = r_view
+        .as_slice()
+        .ok_or_else(|| PyValueError::new_err("rotations_cart must be C-contiguous"))?;
+    let perms_view = permutations.as_array();
+    let perms_slice = perms_view
+        .as_slice()
+        .ok_or_else(|| PyValueError::new_err("permutations must be C-contiguous"))?;
+    let map_atoms_view = map_atoms.as_array();
+    let map_atoms_slice = map_atoms_view
+        .as_slice()
+        .ok_or_else(|| PyValueError::new_err("map_atoms must be C-contiguous"))?;
+    let map_syms_view = map_syms.as_array();
+    let map_syms_slice = map_syms_view
+        .as_slice()
+        .ok_or_else(|| PyValueError::new_err("map_syms must be C-contiguous"))?;
+    let fc_slice = force_constants
+        .as_slice_mut()
+        .map_err(|_| PyValueError::new_err("force_constants must be C-contiguous"))?;
+
+    py.detach(|| {
+        fc2::distribute_fc2(
+            fc_slice,
+            atom_slice,
+            fc_idx_slice,
+            r_slice,
+            perms_slice,
+            map_atoms_slice,
+            map_syms_slice,
+            num_pos,
+        );
+    });
+    Ok(())
+}
+
+#[pyfunction]
+#[pyo3(name = "perm_trans_symmetrize_compact_fc")]
+fn py_perm_trans_symmetrize_compact_fc<'py>(
+    py: Python<'py>,
+    mut force_constants: PyReadwriteArray4<'py, f64>,
+    permutations: PyReadonlyArray2<'py, i64>,
+    s2pp_map: PyReadonlyArray1<'py, i64>,
+    p2s_map: PyReadonlyArray1<'py, i64>,
+    nsym_list: PyReadonlyArray1<'py, i64>,
+    level: i64,
+) -> PyResult<()> {
+    let (n_patom, n_satom) = check_compact_fc_arrays(
+        force_constants.shape(),
+        permutations.shape(),
+        s2pp_map.shape(),
+        p2s_map.shape(),
+        nsym_list.shape(),
+    )?;
+    if level < 0 {
+        return Err(PyValueError::new_err("level must be non-negative"));
+    }
+    let perms_view = permutations.as_array();
+    let perms_slice = perms_view
+        .as_slice()
+        .ok_or_else(|| PyValueError::new_err("permutations must be C-contiguous"))?;
+    let s2pp_view = s2pp_map.as_array();
+    let s2pp_slice = s2pp_view
+        .as_slice()
+        .ok_or_else(|| PyValueError::new_err("s2pp_map must be C-contiguous"))?;
+    let p2s_view = p2s_map.as_array();
+    let p2s_slice = p2s_view
+        .as_slice()
+        .ok_or_else(|| PyValueError::new_err("p2s_map must be C-contiguous"))?;
+    let nsym_view = nsym_list.as_array();
+    let nsym_slice = nsym_view
+        .as_slice()
+        .ok_or_else(|| PyValueError::new_err("nsym_list must be C-contiguous"))?;
+    let fc_slice = force_constants
+        .as_slice_mut()
+        .map_err(|_| PyValueError::new_err("force_constants must be C-contiguous"))?;
+    py.detach(|| {
+        fc2::perm_trans_symmetrize_compact_fc(
+            fc_slice,
+            p2s_slice,
+            s2pp_slice,
+            nsym_slice,
+            perms_slice,
+            n_satom,
+            n_patom,
+            level as usize,
+        );
+    });
+    Ok(())
+}
+
 #[pymodule]
 fn phonors(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_snf3x3, m)?)?;
@@ -4759,5 +5077,10 @@ fn phonors(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_tetrahedra_relative_grid_address, m)?)?;
     m.add_function(wrap_pyfunction!(py_neighboring_grid_points, m)?)?;
     m.add_function(wrap_pyfunction!(py_integration_weights_at_grid_points, m)?)?;
+    m.add_function(wrap_pyfunction!(py_compute_permutation, m)?)?;
+    m.add_function(wrap_pyfunction!(py_perm_trans_symmetrize_fc, m)?)?;
+    m.add_function(wrap_pyfunction!(py_transpose_compact_fc, m)?)?;
+    m.add_function(wrap_pyfunction!(py_perm_trans_symmetrize_compact_fc, m)?)?;
+    m.add_function(wrap_pyfunction!(py_distribute_fc2, m)?)?;
     Ok(())
 }

@@ -24,13 +24,11 @@ pub const IDENTITY: MatI = [[1, 0, 0], [0, 1, 0], [0, 0, 1]];
 pub const INVERSION: MatI = [[-1, 0, 0], [0, -1, 0], [0, 0, -1]];
 
 /// Round-half-away-from-zero, matching the C `(int)(x + 0.5)` idiom
-/// extended to negative inputs.
+/// extended to negative inputs.  `f64::round` already implements this,
+/// so the cast to `i64` (saturating on overflow, 0 on NaN) is the
+/// only thing this wrapper adds.
 pub fn nint(x: f64) -> i64 {
-    if x < 0.0 {
-        (x - 0.5) as i64
-    } else {
-        (x + 0.5) as i64
-    }
+    x.round() as i64
 }
 
 pub fn transpose_i(m: &MatI) -> MatI {
