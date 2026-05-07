@@ -946,6 +946,121 @@ pub fn dynamical_matrices_at_qpoints_gonze(
         });
 }
 
+/// `*mut T` wrapper opting into Send + Sync for rayon.  Only used in
+/// `transform_dynmat_to_fc` where each (i, j) task touches a disjoint
+/// 9-element output block, so the writes never race.
+#[derive(Clone, Copy)]
+struct SyncMutPtr<T>(*mut T);
+unsafe impl<T> Send for SyncMutPtr<T> {}
+unsafe impl<T> Sync for SyncMutPtr<T> {}
+
+impl<T> SyncMutPtr<T> {
+    fn ptr(self) -> *mut T {
+        self.0
+    }
+}
+
+/// Transform dynamical matrices at commensurate q-points back to real-
+/// space force constants.  Mirrors `dym_transform_dynmat_to_fc` in
+/// `c/dynmat.c`.
+///
+/// `fc` has length `n_fc_dim0 * num_satom * 9` (`n_fc_dim0` is
+/// `num_patom` for compact fc or `num_satom` for full fc).  `dm` has
+/// length `n_q * num_band^2` (commensurate q-points stacked, with
+/// `num_band = num_patom * 3`).  `comm_points` are the `n_q`
+/// commensurate q-points in fractional coordinates;
+/// `n_q = num_satom / num_patom` is the number of primitive cells in
+/// the supercell.
+///
+/// `fc_index_map[i]` is the row index into `fc` for primitive-cell
+/// atom `i`; it is `p2s_map[i]` for full fc and `i` for compact fc.
+/// The map must be injective so the per-(i, j) output blocks are
+/// disjoint, allowing the parallel kernel to write without races.
+///
+/// `multi` has shape `[num_satom, num_patom, 2]` (sparse-svecs encoding
+/// of nearest-neighbour pair vectors); `svecs` is the flat shortest-
+/// vector table indexed by `multi[*][1]`.
+#[allow(clippy::too_many_arguments)]
+pub fn transform_dynmat_to_fc(
+    fc: &mut [f64],
+    dm: &[Cmplx],
+    comm_points: &[Vec3D],
+    svecs: &[Vec3D],
+    multi: &[[i64; 2]],
+    masses: &[f64],
+    s2pp_map: &[i64],
+    fc_index_map: &[i64],
+    num_patom: usize,
+    num_satom: usize,
+) {
+    let n_band = num_patom * 3;
+    let n_q = num_satom / num_patom;
+    debug_assert_eq!(comm_points.len(), n_q);
+    debug_assert_eq!(dm.len(), n_q * n_band * n_band);
+    debug_assert_eq!(masses.len(), num_patom);
+    debug_assert_eq!(s2pp_map.len(), num_satom);
+    debug_assert_eq!(multi.len(), num_satom * num_patom);
+    debug_assert_eq!(fc_index_map.len(), num_patom);
+
+    for slot in fc.iter_mut() {
+        *slot = 0.0;
+    }
+
+    let n_pair = num_patom * num_satom;
+    let fc_ptr = SyncMutPtr(fc.as_mut_ptr());
+    let dm_per_q_stride = n_band * n_band;
+    let inv_n_q = 1.0 / (n_q as f64);
+
+    (0..n_pair).into_par_iter().for_each(|ij| {
+        let i = ij / num_satom;
+        let j = ij % num_satom;
+        let i_pair = j * num_patom + i;
+        let m_pair = multi[i_pair][0] as usize;
+        let svecs_adrs = multi[i_pair][1] as usize;
+        let s2pp_j = s2pp_map[j] as usize;
+        let coef = (masses[i] * masses[s2pp_j]).sqrt() * inv_n_q;
+        let inv_m_pair = 1.0 / (m_pair as f64);
+        let row = fc_index_map[i] as usize;
+        // Local 3x3 accumulator for this (i, j) pair; written back at
+        // the end so the inner loop touches stack-resident memory.
+        let mut block = [0.0f64; 9];
+        for (k, comm_q) in comm_points.iter().enumerate() {
+            let mut cos_phase = 0.0;
+            let mut sin_phase = 0.0;
+            for l in 0..m_pair {
+                let svec = svecs[svecs_adrs + l];
+                let phase = -(comm_q[0] * svec[0] + comm_q[1] * svec[1] + comm_q[2] * svec[2]);
+                let arg = phase * 2.0 * PI;
+                cos_phase += arg.cos();
+                sin_phase += arg.sin();
+            }
+            cos_phase *= inv_m_pair;
+            sin_phase *= inv_m_pair;
+            // dm layout: [n_q, num_patom, 3, num_patom, 3] flattened
+            // with the (real, imag) pair packed by Cmplx.
+            let dm_q_base = k * dm_per_q_stride;
+            for l in 0..3 {
+                for m in 0..3 {
+                    let adrs = dm_q_base + i * num_patom * 9 + l * num_patom * 3 + s2pp_j * 3 + m;
+                    let dm_re = dm[adrs][0];
+                    let dm_im = dm[adrs][1];
+                    block[l * 3 + m] += (dm_re * cos_phase - dm_im * sin_phase) * coef;
+                }
+            }
+        }
+        // Disjoint write: (i, j) maps to a unique 9-element offset
+        // because `fc_index_map` is injective on `0..num_patom` and
+        // (i, j) iterates each pair exactly once.
+        let out_base = row * num_satom * 9 + j * 9;
+        unsafe {
+            let p = fc_ptr.ptr();
+            for n in 0..9 {
+                *p.add(out_base + n) = block[n];
+            }
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
