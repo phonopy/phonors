@@ -5754,5 +5754,186 @@ fn phonors(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_transpose_compact_fc, m)?)?;
     m.add_function(wrap_pyfunction!(py_perm_trans_symmetrize_compact_fc, m)?)?;
     m.add_function(wrap_pyfunction!(py_distribute_fc2, m)?)?;
+    m.add_function(wrap_pyfunction!(py_gsv_set_smallest_vectors_sparse, m)?)?;
+    m.add_function(wrap_pyfunction!(py_gsv_set_smallest_vectors_dense, m)?)?;
+    Ok(())
+}
+
+fn _flatten_mat3_f(mat: &PyReadonlyArray2<f64>) -> PyResult<[f64; 9]> {
+    let m = mat3_f(mat)?;
+    Ok([
+        m[0][0], m[0][1], m[0][2], m[1][0], m[1][1], m[1][2], m[2][0], m[2][1], m[2][2],
+    ])
+}
+
+fn _flatten_mat3_i(mat: &PyReadonlyArray2<i64>) -> PyResult<[i64; 9]> {
+    let m = mat3_i(mat)?;
+    Ok([
+        m[0][0], m[0][1], m[0][2], m[1][0], m[1][1], m[1][2], m[2][0], m[2][1], m[2][2],
+    ])
+}
+
+#[pyfunction]
+#[pyo3(name = "gsv_set_smallest_vectors_sparse")]
+fn py_gsv_set_smallest_vectors_sparse<'py>(
+    py: Python<'py>,
+    mut smallest_vectors: PyReadwriteArray4<'py, f64>,
+    mut multiplicity: PyReadwriteArray2<'py, i64>,
+    pos_to: PyReadonlyArray2<'py, f64>,
+    pos_from: PyReadonlyArray2<'py, f64>,
+    lattice_points: PyReadonlyArray2<'py, i64>,
+    reduced_basis: PyReadonlyArray2<'py, f64>,
+    trans_mat: PyReadonlyArray2<'py, i64>,
+    symprec: f64,
+) -> PyResult<()> {
+    let pos_to_shape = pos_to.shape();
+    let num_pos_to = pos_to_shape[0];
+    if pos_to_shape[1] != 3 {
+        return Err(PyValueError::new_err("pos_to must have shape (n, 3)"));
+    }
+    let pos_from_shape = pos_from.shape();
+    let num_pos_from = pos_from_shape[0];
+    if pos_from_shape[1] != 3 {
+        return Err(PyValueError::new_err("pos_from must have shape (n, 3)"));
+    }
+    let lp_shape = lattice_points.shape();
+    let num_lattice = lp_shape[0];
+    if lp_shape[1] != 3 {
+        return Err(PyValueError::new_err(
+            "lattice_points must have shape (n, 3)",
+        ));
+    }
+    if smallest_vectors.shape() != [num_pos_to, num_pos_from, 27, 3] {
+        return Err(PyValueError::new_err(
+            "smallest_vectors must have shape (num_pos_to, num_pos_from, 27, 3)",
+        ));
+    }
+    if multiplicity.shape() != [num_pos_to, num_pos_from] {
+        return Err(PyValueError::new_err(
+            "multiplicity must have shape (num_pos_to, num_pos_from)",
+        ));
+    }
+
+    let reduced = _flatten_mat3_f(&reduced_basis)?;
+    let trans = _flatten_mat3_i(&trans_mat)?;
+
+    let pos_to_view = pos_to.as_array();
+    let pos_to_slice = pos_to_view
+        .as_slice()
+        .ok_or_else(|| PyValueError::new_err("pos_to must be C-contiguous"))?;
+    let pos_from_view = pos_from.as_array();
+    let pos_from_slice = pos_from_view
+        .as_slice()
+        .ok_or_else(|| PyValueError::new_err("pos_from must be C-contiguous"))?;
+    let lp_view = lattice_points.as_array();
+    let lp_slice = lp_view
+        .as_slice()
+        .ok_or_else(|| PyValueError::new_err("lattice_points must be C-contiguous"))?;
+    let svecs_slice = smallest_vectors
+        .as_slice_mut()
+        .map_err(|_| PyValueError::new_err("smallest_vectors must be C-contiguous"))?;
+    let mult_slice = multiplicity
+        .as_slice_mut()
+        .map_err(|_| PyValueError::new_err("multiplicity must be C-contiguous"))?;
+
+    py.detach(|| {
+        cells::set_smallest_vectors_sparse(
+            svecs_slice,
+            mult_slice,
+            pos_to_slice,
+            num_pos_to,
+            pos_from_slice,
+            num_pos_from,
+            lp_slice,
+            num_lattice,
+            &reduced,
+            &trans,
+            symprec,
+        );
+    });
+    Ok(())
+}
+
+#[pyfunction]
+#[pyo3(name = "gsv_set_smallest_vectors_dense")]
+fn py_gsv_set_smallest_vectors_dense<'py>(
+    py: Python<'py>,
+    mut smallest_vectors: PyReadwriteArray2<'py, f64>,
+    mut multiplicity: PyReadwriteArray3<'py, i64>,
+    pos_to: PyReadonlyArray2<'py, f64>,
+    pos_from: PyReadonlyArray2<'py, f64>,
+    lattice_points: PyReadonlyArray2<'py, i64>,
+    reduced_basis: PyReadonlyArray2<'py, f64>,
+    trans_mat: PyReadonlyArray2<'py, i64>,
+    initialize: i64,
+    symprec: f64,
+) -> PyResult<()> {
+    let pos_to_shape = pos_to.shape();
+    let num_pos_to = pos_to_shape[0];
+    if pos_to_shape[1] != 3 {
+        return Err(PyValueError::new_err("pos_to must have shape (n, 3)"));
+    }
+    let pos_from_shape = pos_from.shape();
+    let num_pos_from = pos_from_shape[0];
+    if pos_from_shape[1] != 3 {
+        return Err(PyValueError::new_err("pos_from must have shape (n, 3)"));
+    }
+    let lp_shape = lattice_points.shape();
+    let num_lattice = lp_shape[0];
+    if lp_shape[1] != 3 {
+        return Err(PyValueError::new_err(
+            "lattice_points must have shape (n, 3)",
+        ));
+    }
+    let svecs_shape = smallest_vectors.shape();
+    if svecs_shape[1] != 3 {
+        return Err(PyValueError::new_err(
+            "smallest_vectors must have shape (m, 3)",
+        ));
+    }
+    if multiplicity.shape() != [num_pos_to, num_pos_from, 2] {
+        return Err(PyValueError::new_err(
+            "multiplicity must have shape (num_pos_to, num_pos_from, 2)",
+        ));
+    }
+
+    let reduced = _flatten_mat3_f(&reduced_basis)?;
+    let trans = _flatten_mat3_i(&trans_mat)?;
+
+    let pos_to_view = pos_to.as_array();
+    let pos_to_slice = pos_to_view
+        .as_slice()
+        .ok_or_else(|| PyValueError::new_err("pos_to must be C-contiguous"))?;
+    let pos_from_view = pos_from.as_array();
+    let pos_from_slice = pos_from_view
+        .as_slice()
+        .ok_or_else(|| PyValueError::new_err("pos_from must be C-contiguous"))?;
+    let lp_view = lattice_points.as_array();
+    let lp_slice = lp_view
+        .as_slice()
+        .ok_or_else(|| PyValueError::new_err("lattice_points must be C-contiguous"))?;
+    let svecs_slice = smallest_vectors
+        .as_slice_mut()
+        .map_err(|_| PyValueError::new_err("smallest_vectors must be C-contiguous"))?;
+    let mult_slice = multiplicity
+        .as_slice_mut()
+        .map_err(|_| PyValueError::new_err("multiplicity must be C-contiguous"))?;
+
+    py.detach(|| {
+        cells::set_smallest_vectors_dense(
+            svecs_slice,
+            mult_slice,
+            pos_to_slice,
+            num_pos_to,
+            pos_from_slice,
+            num_pos_from,
+            lp_slice,
+            num_lattice,
+            &reduced,
+            &trans,
+            initialize != 0,
+            symprec,
+        );
+    });
     Ok(())
 }
