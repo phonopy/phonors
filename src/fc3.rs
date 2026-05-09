@@ -761,4 +761,36 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn distribute_fc3_compact_identity_copies_block() {
+        // Compact fc3 with shape (num_first, num_atom, num_atom, 3, 3, 3).
+        // Source (index 0 in the first dim) holds unique values; target
+        // (index 1 in the first dim) is filled in by the kernel under the
+        // identity rotation.  num_atom drives the inner-block strides; the
+        // first-dim size (num_first = 2) is shorter than num_atom = 4.
+        let num_atom = 4;
+        let num_first = 2;
+        let mut fc3 = vec![0.0f64; num_first * num_atom * num_atom * 27];
+        for i in 0..num_atom {
+            for j in 0..num_atom {
+                let base = (i * num_atom + j) * 27;
+                for k in 0..27 {
+                    fc3[base + k] = (1000 * i + 100 * j + k) as f64;
+                }
+            }
+        }
+        let atom_mapping: Vec<i64> = (0..num_atom as i64).collect();
+        distribute_fc3(&mut fc3, 1, 0, &atom_mapping, num_atom, &identity_rot());
+        let stride_src = num_atom * num_atom * 27;
+        for i in 0..num_atom {
+            for j in 0..num_atom {
+                let src = (i * num_atom + j) * 27;
+                let tgt = stride_src + (i * num_atom + j) * 27;
+                for k in 0..27 {
+                    assert!((fc3[tgt + k] - fc3[src + k]).abs() < 1e-15);
+                }
+            }
+        }
+    }
 }
