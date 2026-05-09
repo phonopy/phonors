@@ -4939,8 +4939,20 @@ fn py_distribute_fc3<'py>(
     atom_mapping: PyReadonlyArray1<'py, i64>,
     rot_cart_inv: PyReadonlyArray2<'py, f64>,
 ) -> PyResult<()> {
+    // ``fc3`` may be either full ``(num_atom, num_atom, num_atom, 3, 3, 3)``
+    // or compact ``(num_first, num_atom, num_atom, 3, 3, 3)`` where the
+    // first dim only carries first-displaced atoms.  ``num_atom`` is taken
+    // from ``atom_mapping`` so that the inner-block strides are right in
+    // both cases (mirrors the C path, which sets ``num_atom`` from
+    // ``atom_mapping_py.shape(0)``).  ``target`` and ``source`` index the
+    // first dim (which has size ``num_first``).
     let fc3_shape = fc3.shape();
-    let num_atom = fc3_shape[0];
+    let atom_shape = atom_mapping.shape();
+    if atom_shape.len() != 1 {
+        return Err(PyValueError::new_err("atom_mapping must be 1-D"));
+    }
+    let num_atom = atom_shape[0];
+    let num_first = fc3_shape[0];
     if fc3_shape[1] != num_atom
         || fc3_shape[2] != num_atom
         || fc3_shape[3] != 3
@@ -4948,22 +4960,19 @@ fn py_distribute_fc3<'py>(
         || fc3_shape[5] != 3
     {
         return Err(PyValueError::new_err(
-            "fc3 must have shape (num_atom, num_atom, num_atom, 3, 3, 3)",
-        ));
-    }
-    if atom_mapping.shape() != [num_atom] {
-        return Err(PyValueError::new_err(
-            "atom_mapping must have shape (num_atom,)",
+            "fc3 must have shape (num_first, num_atom, num_atom, 3, 3, 3) \
+             with num_first == num_atom for full fc3 or num_first <= num_atom \
+             for compact fc3",
         ));
     }
     let rot_shape = rot_cart_inv.shape();
     if rot_shape != [3, 3] {
         return Err(PyValueError::new_err("rot_cart_inv must have shape (3, 3)"));
     }
-    if target < 0 || (target as usize) >= num_atom {
+    if target < 0 || (target as usize) >= num_first {
         return Err(PyValueError::new_err("target out of range"));
     }
-    if source < 0 || (source as usize) >= num_atom {
+    if source < 0 || (source as usize) >= num_first {
         return Err(PyValueError::new_err("source out of range"));
     }
 
