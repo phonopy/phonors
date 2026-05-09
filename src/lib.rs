@@ -2934,6 +2934,20 @@ fn py_release_collision_scratch(py: Python<'_>) {
     });
 }
 
+/// Return the size of the rayon worker pool used by phonors.
+///
+/// This reports rayon's configured thread count (controllable via the
+/// ``RAYON_NUM_THREADS`` environment variable or
+/// ``rayon::ThreadPoolBuilder``).  Mirrors the role of
+/// ``phonopy._phonopy.omp_max_threads`` for the Rust backend so callers
+/// can show a "running on N threads" message regardless of which
+/// backend they ended up on.
+#[pyfunction]
+#[pyo3(name = "rayon_max_threads")]
+fn py_rayon_max_threads() -> usize {
+    rayon::current_num_threads()
+}
+
 #[pyfunction]
 #[pyo3(name = "pp_collision")]
 #[allow(clippy::too_many_arguments)]
@@ -5729,6 +5743,7 @@ fn phonors(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_detailed_imag_self_energy_with_g, m)?)?;
     m.add_function(wrap_pyfunction!(py_interaction, m)?)?;
     m.add_function(wrap_pyfunction!(py_release_collision_scratch, m)?)?;
+    m.add_function(wrap_pyfunction!(py_rayon_max_threads, m)?)?;
     m.add_function(wrap_pyfunction!(py_pp_collision, m)?)?;
     m.add_function(wrap_pyfunction!(py_pp_collision_with_sigma, m)?)?;
     m.add_function(wrap_pyfunction!(py_collision_at_grid_point, m)?)?;
