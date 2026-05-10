@@ -3,6 +3,13 @@ name = "phonors"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.75"
+description = "Rust kernels for phonopy and phono3py"
+license = "BSD-3-Clause"
+repository = "https://github.com/phonopy/phonors"
+homepage = "https://github.com/phonopy/phonors"
+readme = "README.md"
+keywords = ["phonon", "phonopy", "phono3py", "lattice-dynamics"]
+categories = ["science"]
 
 [lib]
 name = "phonors"
