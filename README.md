@@ -12,9 +12,30 @@ ported.  It is built with [maturin](https://www.maturin.rs/) and
 
 ## Installation
 
+### From PyPI
+
+```bash
+pip install phonors
+```
+
+### From conda-forge
+
+```bash
+conda install -c conda-forge phonors
+```
+
+## Development
+
+For local development, build and install the extension in editable
+mode against the active Python environment:
+
 ```bash
 maturin develop --release
 ```
+
+`maturin develop` installs the `phonors` extension into the active
+environment; from then on, `import phonors` from anywhere hits the
+editable build.  Re-run after Rust changes.
 
 ### Optional: native CPU tuning
 

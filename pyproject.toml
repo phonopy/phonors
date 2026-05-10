@@ -28,6 +28,8 @@ classifiers = [
 [project.urls]
 Homepage = "https://github.com/phonopy/phonors"
 Repository = "https://github.com/phonopy/phonors"
+Issues = "https://github.com/phonopy/phonors/issues"
+Changelog = "https://github.com/phonopy/phonors/blob/main/CHANGELOG.md"
 
 [tool.maturin]
 manifest-path = "Cargo.toml"
