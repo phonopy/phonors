@@ -5716,7 +5716,7 @@ fn py_perm_trans_symmetrize_compact_fc<'py>(
     Ok(())
 }
 
-#[pymodule]
+#[pymodule(gil_used = false)]
 fn phonors(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_snf3x3, m)?)?;
     m.add_function(wrap_pyfunction!(py_grid_index_from_address, m)?)?;
