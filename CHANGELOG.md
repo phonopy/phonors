@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-05-18
+
+### Changed
+- Set `gil_used = false` to release the GIL during Rust kernel execution
+
 ## [0.1.0] - 2026-05-10
 
 Initial public release.  Provides the Rust kernel set used by
@@ -15,5 +20,6 @@ Initial public release.  Provides the Rust kernel set used by
 `abi3-py310` wheels for Linux x86_64 / aarch64, macOS x86_64 /
 arm64, and Windows x86_64.
 
-[Unreleased]: https://github.com/phonopy/phonors/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/phonopy/phonors/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/phonopy/phonors/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/phonopy/phonors/releases/tag/v0.1.0
