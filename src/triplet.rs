@@ -76,6 +76,12 @@ pub fn set_relative_grid_address(
 /// num_band1 * num_band2`.
 /// `iw_zero` flat layout: `[triplet][freq][b1][b2]` C-order,
 /// length = `num_triplets * num_band0 * num_band1 * num_band2`.
+///
+/// When `inner_par` is false the triplet loop runs in parallel via
+/// rayon (outer parallelism).  When true the loop runs sequentially
+/// and each per-triplet kernel uses its own inner rayon loops; use
+/// this when `num_triplets < rayon::current_num_threads()` so the
+/// thread pool is fully utilised.
 pub fn integration_weight(
     iw: &mut [f64],
     iw_zero: &mut [i8],
@@ -88,6 +94,7 @@ pub fn integration_weight(
     frequencies2: &[f64],
     num_band2: i64,
     tp_type: TpType,
+    inner_par: bool,
 ) -> Result<(), BzGridError> {
     let num_band0 = frequency_points.len() as i64;
     let num_triplets = triplets.len();
@@ -98,7 +105,7 @@ pub fn integration_weight(
         split_iw_per_triplet(iw, tp_type.num_channels(), num_triplets, nb_per_triplet);
     let iwz_chunks: Vec<&mut [i8]> = iw_zero.chunks_mut(nb_per_triplet).collect();
 
-    if outer_parallel(num_triplets) {
+    if !inner_par {
         per_triplet_iw
             .into_par_iter()
             .zip(iwz_chunks.into_par_iter())
@@ -149,6 +156,8 @@ pub fn integration_weight(
 /// Mirrors `tpl_get_integration_weight_with_sigma`.  The C-side
 /// `cutoff = sigma * sigma_cutoff` is computed here, so callers
 /// pass the unitless `sigma_cutoff` (set negative to disable).
+///
+/// `inner_par` has the same semantics as in `integration_weight`.
 pub fn integration_weight_with_sigma(
     iw: &mut [f64],
     iw_zero: &mut [i8],
@@ -159,6 +168,7 @@ pub fn integration_weight_with_sigma(
     frequencies: &[f64],
     num_band: i64,
     tp_type: TpType,
+    inner_par: bool,
 ) {
     let num_band0 = frequency_points.len() as i64;
     let num_triplets = triplets.len();
@@ -169,7 +179,7 @@ pub fn integration_weight_with_sigma(
         split_iw_per_triplet(iw, tp_type.num_channels(), num_triplets, nb_per_triplet);
     let iwz_chunks: Vec<&mut [i8]> = iw_zero.chunks_mut(nb_per_triplet).collect();
 
-    if outer_parallel(num_triplets) {
+    if !inner_par {
         per_triplet_iw
             .into_par_iter()
             .zip(iwz_chunks.into_par_iter())
@@ -208,13 +218,6 @@ pub fn integration_weight_with_sigma(
             );
         }
     }
-}
-
-/// Choose outer (per-triplet) parallelism when there are at least as
-/// many triplets as worker threads; otherwise the caller falls back to
-/// inner (per-`b12`) parallelism inside each triplet kernel.
-fn outer_parallel(num_triplets: usize) -> bool {
-    num_triplets >= rayon::current_num_threads()
 }
 
 /// Split a channel-major flat output buffer into per-triplet, per-channel

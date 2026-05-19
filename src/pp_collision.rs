@@ -62,18 +62,23 @@ thread_local! {
 }
 
 /// Acquire the calling thread's `CollisionScratch`, run `f`, and
-/// release the borrow.  Panics if called recursively (which would
-/// indicate two collision kernels stacked on the same thread).
+/// return the scratch to the cell.  Uses take-and-put-back so the
+/// `borrow_mut` is released before `f` runs, preventing a panic when
+/// rayon work-stealing delivers a second outer task to this thread
+/// while `f` (which may spawn inner rayon work) is executing.
 fn with_scratch<F, R>(num_band_prod: usize, f: F) -> R
 where
     F: FnOnce(&mut CollisionScratch) -> R,
 {
+    let mut scratch = COLLISION_SCRATCH.with(|cell| {
+        cell.borrow_mut().take().unwrap_or_default()
+    });
+    scratch.reset(num_band_prod);
+    let result = f(&mut scratch);
     COLLISION_SCRATCH.with(|cell| {
-        let mut opt = cell.borrow_mut();
-        let scratch = opt.get_or_insert_with(CollisionScratch::default);
-        scratch.reset(num_band_prod);
-        f(scratch)
-    })
+        *cell.borrow_mut() = Some(scratch);
+    });
+    result
 }
 
 /// Release the per-rayon-worker `CollisionScratch` instances back to
