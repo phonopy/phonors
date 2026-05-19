@@ -70,9 +70,7 @@ fn with_scratch<F, R>(num_band_prod: usize, f: F) -> R
 where
     F: FnOnce(&mut CollisionScratch) -> R,
 {
-    let mut scratch = COLLISION_SCRATCH.with(|cell| {
-        cell.borrow_mut().take().unwrap_or_default()
-    });
+    let mut scratch = COLLISION_SCRATCH.with(|cell| cell.borrow_mut().take().unwrap_or_default());
     scratch.reset(num_band_prod);
     let result = f(&mut scratch);
     COLLISION_SCRATCH.with(|cell| {
