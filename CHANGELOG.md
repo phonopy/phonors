@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-05-20
+
+### Fixed
+- Fix `RefCell` double-borrow panic in `pp_collision::with_scratch` under rayon
+  work-stealing when `inner_par` is true; use take-and-put-back so the borrow
+  is released before the closure runs.
+
 ## [0.1.1] - 2026-05-18
 
 ### Changed
@@ -20,6 +27,7 @@ Initial public release.  Provides the Rust kernel set used by
 `abi3-py310` wheels for Linux x86_64 / aarch64, macOS x86_64 /
 arm64, and Windows x86_64.
 
-[Unreleased]: https://github.com/phonopy/phonors/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/phonopy/phonors/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/phonopy/phonors/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/phonopy/phonors/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/phonopy/phonors/releases/tag/v0.1.0
