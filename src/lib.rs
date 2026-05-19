@@ -479,9 +479,10 @@ fn py_triplets_integration_weights<'py>(
             gp_map: bzmap_slice,
             bz_grid_type,
         };
+        let inner_par = trip.len() < rayon::current_num_threads();
         triplet::integration_weight(
             iw_slice, iwz_slice, fp_slice, &rga, &trip, &bzgrid, f1_slice, num_band1, f2_slice,
-            num_band2, tp,
+            num_band2, tp, inner_par,
         )
     })
     .map_err(|e| match e {
@@ -530,6 +531,7 @@ fn py_triplets_integration_weights_with_sigma<'py>(
         .map_err(|_| PyValueError::new_err("iw_zero must be C-contiguous"))?;
 
     py.detach(|| {
+        let inner_par = trip.len() < rayon::current_num_threads();
         triplet::integration_weight_with_sigma(
             iw_slice,
             iwz_slice,
@@ -540,6 +542,7 @@ fn py_triplets_integration_weights_with_sigma<'py>(
             f_slice,
             num_band,
             tp,
+            inner_par,
         );
     });
     Ok(())
