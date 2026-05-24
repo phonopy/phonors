@@ -496,6 +496,151 @@ pub fn get_recip_dipole_dipole(
     }
 }
 
+/// Build the analytic derivative of the dipole-dipole reciprocal sum
+/// (d D_DD / d q_cart) at a single q-point for Gonze-Lee NAC.  See
+/// `dDdq/main.tex` in the phonopy tree for the derivation.
+///
+/// `dd` (output) has shape `[3, num_patom, 3, num_patom, 3]` complex
+/// (flat `3 * num_patom^2 * 9`); the leading axis is the cartesian
+/// derivative direction.  `factor` is `4*pi/V * unit_conversion` and
+/// is applied to the entire output.  `q_direction_cart` is used only
+/// when the G=0 term is reached at q=0 (matching `get_dd`).  No
+/// `dd_q0` argument: the translational-invariance correction
+/// (Eq. (52) of the JPCM review) is q-independent and contributes
+/// zero to the derivative.
+#[allow(clippy::too_many_arguments)]
+pub fn get_derivative_recip_dipole_dipole(
+    dd: &mut [Cmplx],
+    g_list: &[Vec3D],
+    num_patom: usize,
+    q_cart: Vec3D,
+    q_direction_cart: Option<Vec3D>,
+    born: &[[[f64; 3]; 3]],
+    dielectric: &MatD,
+    pos: &[Vec3D],
+    factor: f64,
+    lambda: f64,
+) {
+    let n_per_mu = num_patom * num_patom * 9;
+    debug_assert_eq!(dd.len(), 3 * n_per_mu);
+    debug_assert_eq!(born.len(), num_patom);
+    debug_assert_eq!(pos.len(), num_patom);
+
+    for c in dd.iter_mut() {
+        *c = [0.0, 0.0];
+    }
+
+    // Pre-compute T_mu(Q) * exp(-B/(4 Lambda^2)) per G.  See
+    // `dDdq/main.tex`: T_mu has shape (3, 3, 3) over (mu, beta, beta').
+    let lambda_sq = lambda * lambda;
+    let mut kk: Vec<[MatD; 3]> = vec![[[[0.0; 3]; 3]; 3]; g_list.len()];
+    let q_at_gamma = at_gamma_continuous(q_cart);
+    for (g, kk_g) in g_list.iter().zip(kk.iter_mut()) {
+        let q_k = [g[0] + q_cart[0], g[1] + q_cart[1], g[2] + q_cart[2]];
+        if q_at_gamma {
+            let norm = q_k[0] * q_k[0] + q_k[1] * q_k[1] + q_k[2] * q_k[2];
+            if norm < Q2_ZERO_TOLERANCE {
+                if let Some(qd) = q_direction_cart {
+                    fill_t_mu_slab(kk_g, qd, dielectric, lambda_sq);
+                }
+                // q_direction_cart == None leaves kk_g at zero.
+                continue;
+            }
+        }
+        fill_t_mu_slab(kk_g, q_k, dielectric, lambda_sq);
+    }
+
+    // Accumulate the phased sum into a "pre-Born" buffer.
+    let mut dd_tmp: Vec<Cmplx> = vec![[0.0; 2]; 3 * n_per_mu];
+    for (g, kk_g) in g_list.iter().zip(kk.iter()) {
+        for i in 0..num_patom {
+            for j in 0..num_patom {
+                d_dd_at_g(&mut dd_tmp, i, j, *g, num_patom, pos, kk_g);
+            }
+        }
+    }
+
+    // Apply Born charges per mu slab.  Each slab has the same
+    // [num_patom, 3, num_patom, 3] layout as `get_recip_dipole_dipole`.
+    for mu in 0..3 {
+        let offset = mu * n_per_mu;
+        multiply_borns(
+            &mut dd[offset..offset + n_per_mu],
+            &dd_tmp[offset..offset + n_per_mu],
+            num_patom,
+            born,
+        );
+    }
+
+    for c in dd.iter_mut() {
+        c[0] *= factor;
+        c[1] *= factor;
+    }
+}
+
+/// Fill `out[mu][beta][beta']` with T_mu(Q; beta, beta') * exp(-B/(4
+/// Lambda^2)) at a single Q.  Used by
+/// `get_derivative_recip_dipole_dipole`.  B is assumed non-zero (the
+/// caller short-circuits the Q=0 case).
+fn fill_t_mu_slab(out: &mut [MatD; 3], q_k: Vec3D, dielectric: &MatD, lambda_sq: f64) {
+    let mut v = [0.0f64; 3];
+    for i in 0..3 {
+        let mut s = 0.0;
+        for j in 0..3 {
+            s += dielectric[i][j] * q_k[j];
+        }
+        v[i] = s;
+    }
+    let b = q_k[0] * v[0] + q_k[1] * v[1] + q_k[2] * v[2];
+    let inv_b = 1.0 / b;
+    let damp = (-b / (4.0 * lambda_sq)).exp();
+    let k_coef = 2.0 / (b * b) + 1.0 / (2.0 * lambda_sq * b);
+    for mu in 0..3 {
+        let k_mu = v[mu] * k_coef;
+        for beta in 0..3 {
+            let dmb = if mu == beta { 1.0 } else { 0.0 };
+            for betap in 0..3 {
+                let dmbp = if mu == betap { 1.0 } else { 0.0 };
+                let t =
+                    (dmb * q_k[betap] + q_k[beta] * dmbp) * inv_b - q_k[beta] * q_k[betap] * k_mu;
+                out[mu][beta][betap] = t * damp;
+            }
+        }
+    }
+}
+
+/// Per-G accumulation into the derivative `[mu, i, alpha, j, beta]`
+/// buffer.  Same phase convention as `dd_at_g`; just adds a leading
+/// `mu` slab dimension.
+fn d_dd_at_g(
+    dd_part: &mut [Cmplx],
+    i: usize,
+    j: usize,
+    g_vec: Vec3D,
+    num_patom: usize,
+    pos: &[Vec3D],
+    kk: &[MatD; 3],
+) {
+    let mut phase = 0.0;
+    for k in 0..3 {
+        phase += (pos[i][k] - pos[j][k]) * g_vec[k];
+    }
+    phase *= 2.0 * PI;
+    let cos_phase = phase.cos();
+    let sin_phase = phase.sin();
+    let n_per_mu = num_patom * num_patom * 9;
+    for mu in 0..3 {
+        let mu_offset = mu * n_per_mu;
+        for k in 0..3 {
+            for l in 0..3 {
+                let adrs = mu_offset + i * num_patom * 9 + k * num_patom * 3 + j * 3 + l;
+                dd_part[adrs][0] += kk[mu][k][l] * cos_phase;
+                dd_part[adrs][1] += kk[mu][k][l] * sin_phase;
+            }
+        }
+    }
+}
+
 /// In-place Hermitian symmetrization: `mat <- (mat + mat^H) / 2`.
 /// Mirrors `make_Hermitian` in `c/dynmat.c`.  Diagonal entries lose
 /// their imaginary part (as they should for a Hermitian matrix).
