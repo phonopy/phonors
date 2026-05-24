@@ -962,6 +962,95 @@ fn py_recip_dipole_dipole<'py>(
     Ok(())
 }
 
+#[pyfunction]
+#[pyo3(name = "derivative_recip_dipole_dipole")]
+#[pyo3(signature = (dd, g_list, q_cart, born, dielectric, pos, factor, lambda_, q_direction_cart=None))]
+#[allow(clippy::too_many_arguments)]
+fn py_derivative_recip_dipole_dipole<'py>(
+    py: Python<'py>,
+    mut dd: PyReadwriteArray5<'py, Complex64>,
+    g_list: PyReadonlyArray2<'py, f64>,
+    q_cart: PyReadonlyArray1<'py, f64>,
+    born: PyReadonlyArray3<'py, f64>,
+    dielectric: PyReadonlyArray2<'py, f64>,
+    pos: PyReadonlyArray2<'py, f64>,
+    factor: f64,
+    lambda_: f64,
+    q_direction_cart: Option<PyReadonlyArray1<'py, f64>>,
+) -> PyResult<()> {
+    let num_patom = born.shape()[0];
+    if born.shape() != [num_patom, 3, 3] {
+        return Err(PyValueError::new_err(
+            "born must have shape (num_patom, 3, 3)",
+        ));
+    }
+    if dd.shape() != [3, num_patom, 3, num_patom, 3] {
+        return Err(PyValueError::new_err(
+            "dd must have shape (3, num_patom, 3, num_patom, 3)",
+        ));
+    }
+    if pos.shape() != [num_patom, 3] {
+        return Err(PyValueError::new_err("pos must have shape (num_patom, 3)"));
+    }
+    let g_shape = g_list.shape();
+    if g_shape.len() != 2 || g_shape[1] != 3 {
+        return Err(PyValueError::new_err("g_list must have shape (num_G, 3)"));
+    }
+    if q_cart.shape() != [3] {
+        return Err(PyValueError::new_err("q_cart must have shape (3,)"));
+    }
+
+    let diel = mat3_f(&dielectric)?;
+
+    let q_view = q_cart.as_array();
+    let q3 = [q_view[0], q_view[1], q_view[2]];
+
+    let qd_view;
+    let qd: Option<[f64; 3]> = match q_direction_cart.as_ref() {
+        None => None,
+        Some(arr) => {
+            if arr.shape() != [3] {
+                return Err(PyValueError::new_err(
+                    "q_direction_cart must have shape (3,)",
+                ));
+            }
+            qd_view = arr.as_array();
+            Some([qd_view[0], qd_view[1], qd_view[2]])
+        }
+    };
+
+    let g_view = g_list.as_array();
+    let g_flat = g_view
+        .as_slice()
+        .ok_or_else(|| PyValueError::new_err("g_list must be C-contiguous"))?;
+    let g_slice: &[[f64; 3]] = group_as_array(g_flat);
+
+    let pos_view = pos.as_array();
+    let pos_flat = pos_view
+        .as_slice()
+        .ok_or_else(|| PyValueError::new_err("pos must be C-contiguous"))?;
+    let pos_slice: &[[f64; 3]] = group_as_array(pos_flat);
+
+    let born_view = born.as_array();
+    let born_flat = born_view
+        .as_slice()
+        .ok_or_else(|| PyValueError::new_err("born must be C-contiguous"))?;
+    let born_slice: &[[[f64; 3]; 3]] = group_as_array_2d::<f64, 3, 3>(born_flat);
+
+    let dd_slice = dd
+        .as_slice_mut()
+        .map_err(|_| PyValueError::new_err("dd must be C-contiguous"))?;
+    let dd_cmplx = complex_as_cmplx_mut(dd_slice);
+
+    py.detach(|| {
+        dynmat::get_derivative_recip_dipole_dipole(
+            dd_cmplx, g_slice, num_patom, q3, qd, born_slice, &diel, pos_slice, factor, lambda_,
+        );
+    });
+
+    Ok(())
+}
+
 /// Build dynamical matrices at the listed grid points (Wang- or
 /// no-NAC path).
 ///
@@ -5737,6 +5826,7 @@ fn phonors(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_charge_sum, m)?)?;
     m.add_function(wrap_pyfunction!(py_recip_dipole_dipole_q0, m)?)?;
     m.add_function(wrap_pyfunction!(py_recip_dipole_dipole, m)?)?;
+    m.add_function(wrap_pyfunction!(py_derivative_recip_dipole_dipole, m)?)?;
     m.add_function(wrap_pyfunction!(py_dynamical_matrices_at_gridpoints, m)?)?;
     m.add_function(wrap_pyfunction!(
         py_dynamical_matrices_at_gridpoints_gonze,
