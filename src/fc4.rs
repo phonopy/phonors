@@ -860,7 +860,8 @@ mod tests {
             for j in 0..num_atom {
                 for k in 0..num_atom {
                     let blk = ((i * num_atom + j) * num_atom + k) * 81;
-                    let src = (((0 * num_atom + i) * num_atom + j) * num_atom + k) * 27;
+                    // delta_fc3s displacement 0: ((i*n + j)*n + k) block of 27.
+                    let src = ((i * num_atom + j) * num_atom + k) * 27;
                     for lead in 0..3 {
                         for bcd in 0..27 {
                             let expected = inv_u[lead * total] * delta_fc3s[src + bcd];
