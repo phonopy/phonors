@@ -279,23 +279,20 @@ fn get_dd(
     // below will divide by zero (`dpart = 0`).  Phonopy does not
     // strictly enforce the first-BZ precondition today; phono3py does.
     // Revisit this when the precondition is broken in practice.
-    let q_at_gamma = at_gamma_continuous(q_cart);
     for (g, kk_g) in g_list.iter().zip(kk.iter_mut()) {
         let q_k = [g[0] + q_cart[0], g[1] + q_cart[1], g[2] + q_cart[2]];
-        if q_at_gamma {
-            let norm = q_k[0] * q_k[0] + q_k[1] * q_k[1] + q_k[2] * q_k[2];
-            if norm < Q2_ZERO_TOLERANCE {
-                if let Some(qd) = q_direction_cart {
-                    let dpart = dielectric_part(qd, dielectric);
-                    for i in 0..3 {
-                        for j in 0..3 {
-                            kk_g[i][j] = qd[i] * qd[j] / dpart;
-                        }
+        let norm = q_k[0] * q_k[0] + q_k[1] * q_k[1] + q_k[2] * q_k[2];
+        if norm < Q2_ZERO_TOLERANCE {
+            if let Some(qd) = q_direction_cart {
+                let dpart = dielectric_part(qd, dielectric);
+                for i in 0..3 {
+                    for j in 0..3 {
+                        kk_g[i][j] = qd[i] * qd[j] / dpart;
                     }
                 }
-                // q_direction_cart == None leaves kk_g at zero.
-                continue;
             }
+            // q_direction_cart == None leaves kk_g at zero.
+            continue;
         }
         let dpart = dielectric_part(q_k, dielectric);
         let damp = (-dpart / l2).exp();
@@ -534,18 +531,15 @@ pub fn get_derivative_recip_dipole_dipole(
     // `dDdq/main.tex`: T_mu has shape (3, 3, 3) over (mu, beta, beta').
     let lambda_sq = lambda * lambda;
     let mut kk: Vec<[MatD; 3]> = vec![[[[0.0; 3]; 3]; 3]; g_list.len()];
-    let q_at_gamma = at_gamma_continuous(q_cart);
     for (g, kk_g) in g_list.iter().zip(kk.iter_mut()) {
         let q_k = [g[0] + q_cart[0], g[1] + q_cart[1], g[2] + q_cart[2]];
-        if q_at_gamma {
-            let norm = q_k[0] * q_k[0] + q_k[1] * q_k[1] + q_k[2] * q_k[2];
-            if norm < Q2_ZERO_TOLERANCE {
-                if let Some(qd) = q_direction_cart {
-                    fill_t_mu_slab(kk_g, qd, dielectric, lambda_sq);
-                }
-                // q_direction_cart == None leaves kk_g at zero.
-                continue;
+        let norm = q_k[0] * q_k[0] + q_k[1] * q_k[1] + q_k[2] * q_k[2];
+        if norm < Q2_ZERO_TOLERANCE {
+            if let Some(qd) = q_direction_cart {
+                fill_t_mu_slab(kk_g, qd, dielectric, lambda_sq);
             }
+            // q_direction_cart == None leaves kk_g at zero.
+            continue;
         }
         fill_t_mu_slab(kk_g, q_k, dielectric, lambda_sq);
     }
