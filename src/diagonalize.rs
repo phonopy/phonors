@@ -121,6 +121,78 @@ pub fn eigsh_batch(dynmats: &[Cmplx], evals: &mut [f64], evecs: &mut [Cmplx], n:
         );
 }
 
+/// Per-worker reusable workspace for [`eigvals_one`], sized for an `n x n`
+/// matrix.  Like [`EvdScratch`] but without the eigenvector matrix: the
+/// faer workspace is requested with `ComputeEigenvectors::No`, so neither
+/// the `u` buffer nor the eigenvector-related scratch is allocated.
+struct EvalsScratch {
+    mem: MemBuffer,
+    s: Diag<c64>,
+}
+
+impl EvalsScratch {
+    fn new(n: usize) -> Self {
+        let req = self_adjoint_evd_scratch::<c64>(
+            n,
+            ComputeEigenvectors::No,
+            Par::Seq,
+            Default::default(),
+        );
+        Self {
+            mem: MemBuffer::new(req),
+            s: Diag::zeros(n),
+        }
+    }
+}
+
+/// Compute only the eigenvalues of one Hermitian matrix `d` (row-major
+/// `[n, n]` `Cmplx`), writing them into `evals[0..n]` (nondecreasing).
+///
+/// Same input contract as [`eigsh_one`], but passes `None` for the
+/// eigenvectors so faer skips the back-transformation entirely.  `d` is
+/// only read (and only its lower triangle, as the matrix is Hermitian).
+fn eigvals_one(d: &[Cmplx], n: usize, evals: &mut [f64], sc: &mut EvalsScratch) {
+    debug_assert_eq!(d.len(), n * n);
+    debug_assert_eq!(evals.len(), n);
+
+    let a = MatRef::<c64>::from_row_major_slice(cmplx_as_c64(d), n, n);
+    let stack = MemStack::new(&mut sc.mem);
+    self_adjoint_evd(
+        a,
+        sc.s.as_mut(),
+        None,
+        Par::Seq,
+        stack,
+        Default::default(),
+    )
+    .expect("faer self_adjoint_evd failed");
+
+    let s = sc.s.column_vector();
+    for i in 0..n {
+        evals[i] = s[i].re;
+    }
+}
+
+/// Batched eigenvalues-only Hermitian eigendecomposition, parallel over
+/// the `nq` matrices.
+///
+/// `dynmats` is `[nq, n, n]` row-major Hermitian, `evals` is `[nq, n]`.
+/// Each matrix is solved single-threaded; the caller should run this
+/// under `py.detach` to release the GIL.
+pub fn eigvals_batch(dynmats: &[Cmplx], evals: &mut [f64], n: usize) {
+    if n == 0 {
+        return;
+    }
+    let m2 = n * n;
+    evals
+        .par_chunks_mut(n)
+        .zip(dynmats.par_chunks(m2))
+        .for_each_init(
+            || EvalsScratch::new(n),
+            |sc, (ev, d)| eigvals_one(d, n, ev, sc),
+        );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -143,6 +215,62 @@ mod tests {
         let mut sc = EvdScratch::new(n);
         eigsh_one(d, n, &mut evals, &mut evecs, &mut sc);
         (evals, evecs)
+    }
+
+    /// Eigenvalues of a single `n x n` row-major Hermitian matrix.
+    fn eigvals(d: &[Cmplx], n: usize) -> Vec<f64> {
+        let mut evals = vec![0.0f64; n];
+        let mut sc = EvalsScratch::new(n);
+        eigvals_one(d, n, &mut evals, &mut sc);
+        evals
+    }
+
+    #[test]
+    fn values_known_2x2() {
+        // A = [[2, 1 - i], [1 + i, 3]]; eigenvalues 1 and 4.
+        let d: [Cmplx; 4] = [[2.0, 0.0], [1.0, -1.0], [1.0, 1.0], [3.0, 0.0]];
+        let evals = eigvals(&d, 2);
+        assert!((evals[0] - 1.0).abs() < 1e-12, "{:?}", evals);
+        assert!((evals[1] - 4.0).abs() < 1e-12, "{:?}", evals);
+    }
+
+    #[test]
+    fn values_match_full_and_ascending() {
+        for &n in &[1usize, 2, 6, 13] {
+            let d = hermitian_fixture(n);
+            let (full, _) = eigh(&d, n);
+            let only = eigvals(&d, n);
+            for i in 0..n {
+                assert!(
+                    (full[i] - only[i]).abs() < 1e-12,
+                    "n={n} band={i}: full={} only={}",
+                    full[i],
+                    only[i]
+                );
+            }
+            for w in only.windows(2) {
+                assert!(w[0] <= w[1] + 1e-12, "n={n} not ascending: {only:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn values_batch_matches_single() {
+        let n = 5;
+        let a = hermitian_fixture(n);
+        let b = hermitian_fixture_seed(n, 9);
+        let mut dynmats = Vec::new();
+        dynmats.extend_from_slice(&a);
+        dynmats.extend_from_slice(&b);
+        let mut evals = vec![0.0f64; 2 * n];
+        eigvals_batch(&dynmats, &mut evals, n);
+
+        let ea = eigvals(&a, n);
+        let eb = eigvals(&b, n);
+        for i in 0..n {
+            assert!((evals[i] - ea[i]).abs() < 1e-12);
+            assert!((evals[n + i] - eb[i]).abs() < 1e-12);
+        }
     }
 
     #[test]

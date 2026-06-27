@@ -14,6 +14,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   for dense meshes of small matrices. Numerically a drop-in for
   `numpy.linalg.eigh`: eigenvalues are returned in ascending order,
   eigenvectors as columns, and the input matrices are left unmodified.
+- `eigvalsh_values_batch` kernel: same as `eigvalsh_batch` but computes only
+  the eigenvalues, skipping the eigenvectors and their output buffer. A
+  drop-in for `numpy.linalg.eigvalsh`.
 
 ## [0.2.1] - 2026-06-11
 
