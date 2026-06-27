@@ -157,15 +157,8 @@ fn eigvals_one(d: &[Cmplx], n: usize, evals: &mut [f64], sc: &mut EvalsScratch) 
 
     let a = MatRef::<c64>::from_row_major_slice(cmplx_as_c64(d), n, n);
     let stack = MemStack::new(&mut sc.mem);
-    self_adjoint_evd(
-        a,
-        sc.s.as_mut(),
-        None,
-        Par::Seq,
-        stack,
-        Default::default(),
-    )
-    .expect("faer self_adjoint_evd failed");
+    self_adjoint_evd(a, sc.s.as_mut(), None, Par::Seq, stack, Default::default())
+        .expect("faer self_adjoint_evd failed");
 
     let s = sc.s.column_vector();
     for i in 0..n {
