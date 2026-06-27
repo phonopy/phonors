@@ -6388,6 +6388,54 @@ fn py_eigvalsh_batch<'py>(
     Ok(())
 }
 
+/// Compute only the eigenvalues of a batch of Hermitian dynamical
+/// matrices.
+///
+/// Same contract as ``eigvalsh_batch`` but without eigenvectors:
+/// ``dynmats`` is complex128 ``(n_q, num_band, num_band)`` and is left
+/// unmodified; ``eigenvalues`` (float64 ``(n_q, num_band)``) receives the
+/// eigenvalues in nondecreasing order.  Skipping the eigenvectors avoids
+/// their back-transformation and output buffer.  Numerically a drop-in
+/// for ``numpy.linalg.eigvalsh`` applied over the leading axis.
+#[pyfunction]
+#[pyo3(name = "eigvalsh_values_batch")]
+#[pyo3(signature = (dynmats, eigenvalues))]
+fn py_eigvalsh_values_batch<'py>(
+    py: Python<'py>,
+    dynmats: PyReadonlyArray3<'py, Complex64>,
+    mut eigenvalues: PyReadwriteArray2<'py, f64>,
+) -> PyResult<()> {
+    let shape = dynmats.shape();
+    let n_q = shape[0];
+    let num_band = shape[1];
+
+    if shape[2] != num_band {
+        return Err(PyValueError::new_err(
+            "dynmats must have shape (n_q, num_band, num_band)",
+        ));
+    }
+    if eigenvalues.shape() != [n_q, num_band] {
+        return Err(PyValueError::new_err(
+            "eigenvalues must have shape (n_q, num_band)",
+        ));
+    }
+
+    let dynmats_view = dynmats.as_array();
+    let dynmats_flat = dynmats_view
+        .as_slice()
+        .ok_or_else(|| PyValueError::new_err("dynmats must be C-contiguous"))?;
+    let dynmats_cmplx = complex_as_cmplx(dynmats_flat);
+
+    let evals_slice = eigenvalues
+        .as_slice_mut()
+        .map_err(|_| PyValueError::new_err("eigenvalues must be C-contiguous"))?;
+
+    py.detach(|| {
+        diagonalize::eigvals_batch(dynmats_cmplx, evals_slice, num_band);
+    });
+    Ok(())
+}
+
 #[pymodule(gil_used = false)]
 fn phonors(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_snf3x3, m)?)?;
@@ -6418,6 +6466,7 @@ fn phonors(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_dynamical_matrices_at_qpoints, m)?)?;
     m.add_function(wrap_pyfunction!(py_dynamical_matrices_at_qpoints_gonze, m)?)?;
     m.add_function(wrap_pyfunction!(py_eigvalsh_batch, m)?)?;
+    m.add_function(wrap_pyfunction!(py_eigvalsh_values_batch, m)?)?;
     m.add_function(wrap_pyfunction!(py_transform_dynmat_to_fc, m)?)?;
     m.add_function(wrap_pyfunction!(py_derivative_dynmat_at_q, m)?)?;
     m.add_function(wrap_pyfunction!(py_real_to_reciprocal, m)?)?;
