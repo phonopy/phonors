@@ -23,6 +23,7 @@ extension-module = ["pyo3/extension-module"]
 pyo3 = { version = "0.28", features = ["abi3-py310"] }
 numpy = "0.28"
 rayon = "1"
+faer = { version = "0.24", default-features = false, features = ["std", "linalg"] }
 
 [lints.clippy]
 # Numeric kernels favour explicit `for i in 0..n` loops with multi-dimensional

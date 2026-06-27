@@ -15,6 +15,7 @@ mod cells;
 mod collision_matrix;
 mod common;
 mod derivative_dynmat;
+mod diagonalize;
 mod dynmat;
 mod fc2;
 mod fc3;
@@ -6327,6 +6328,66 @@ fn py_perm_trans_symmetrize_compact_fc<'py>(
     Ok(())
 }
 
+/// Diagonalize a batch of Hermitian dynamical matrices.
+///
+/// Numerically a drop-in for ``numpy.linalg.eigh`` applied over the
+/// leading axis: ``dynmats`` is complex128 ``(n_q, num_band, num_band)``
+/// and is left unmodified; ``eigenvalues`` (float64 ``(n_q, num_band)``)
+/// receives the eigenvalues in nondecreasing order and ``eigvecs``
+/// (complex128 ``(n_q, num_band, num_band)``) the eigenvectors as
+/// columns (``eigvecs[q, component, band]``).  Each matrix is solved
+/// single-threaded by faer while rayon parallelizes over ``n_q`` — the
+/// efficient layout for a dense q-mesh of small matrices.
+#[pyfunction]
+#[pyo3(name = "eigvalsh_batch")]
+#[pyo3(signature = (dynmats, eigenvalues, eigvecs))]
+fn py_eigvalsh_batch<'py>(
+    py: Python<'py>,
+    dynmats: PyReadonlyArray3<'py, Complex64>,
+    mut eigenvalues: PyReadwriteArray2<'py, f64>,
+    mut eigvecs: PyReadwriteArray3<'py, Complex64>,
+) -> PyResult<()> {
+    let shape = dynmats.shape();
+    let n_q = shape[0];
+    let num_band = shape[1];
+
+    if shape[2] != num_band {
+        return Err(PyValueError::new_err(
+            "dynmats must have shape (n_q, num_band, num_band)",
+        ));
+    }
+    if eigenvalues.shape() != [n_q, num_band] {
+        return Err(PyValueError::new_err(
+            "eigenvalues must have shape (n_q, num_band)",
+        ));
+    }
+    if eigvecs.shape() != [n_q, num_band, num_band] {
+        return Err(PyValueError::new_err(
+            "eigvecs must have shape (n_q, num_band, num_band)",
+        ));
+    }
+
+    let dynmats_view = dynmats.as_array();
+    let dynmats_flat = dynmats_view
+        .as_slice()
+        .ok_or_else(|| PyValueError::new_err("dynmats must be C-contiguous"))?;
+    let dynmats_cmplx = complex_as_cmplx(dynmats_flat);
+
+    let evals_slice = eigenvalues
+        .as_slice_mut()
+        .map_err(|_| PyValueError::new_err("eigenvalues must be C-contiguous"))?;
+
+    let evecs_slice = eigvecs
+        .as_slice_mut()
+        .map_err(|_| PyValueError::new_err("eigvecs must be C-contiguous"))?;
+    let evecs_cmplx = complex_as_cmplx_mut(evecs_slice);
+
+    py.detach(|| {
+        diagonalize::eigsh_batch(dynmats_cmplx, evals_slice, evecs_cmplx, num_band);
+    });
+    Ok(())
+}
+
 #[pymodule(gil_used = false)]
 fn phonors(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_snf3x3, m)?)?;
@@ -6356,6 +6417,7 @@ fn phonors(m: &Bound<'_, PyModule>) -> PyResult<()> {
     )?)?;
     m.add_function(wrap_pyfunction!(py_dynamical_matrices_at_qpoints, m)?)?;
     m.add_function(wrap_pyfunction!(py_dynamical_matrices_at_qpoints_gonze, m)?)?;
+    m.add_function(wrap_pyfunction!(py_eigvalsh_batch, m)?)?;
     m.add_function(wrap_pyfunction!(py_transform_dynmat_to_fc, m)?)?;
     m.add_function(wrap_pyfunction!(py_derivative_dynmat_at_q, m)?)?;
     m.add_function(wrap_pyfunction!(py_real_to_reciprocal, m)?)?;

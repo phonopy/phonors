@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `eigvalsh_batch` kernel for diagonalizing a batch of Hermitian dynamical
+  matrices. Each matrix is solved single-threaded while the batch is
+  parallelized across cores, giving a large speedup over `numpy.linalg.eigh`
+  for dense meshes of small matrices. Numerically a drop-in for
+  `numpy.linalg.eigh`: eigenvalues are returned in ascending order,
+  eigenvectors as columns, and the input matrices are left unmodified.
+
 ## [0.2.1] - 2026-06-11
 
 ### Added
