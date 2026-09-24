@@ -2,6 +2,8 @@
 //!
 //! Port of `bzg_get_bz_grid_addresses` and friends in `c/bzgrid.c`.
 
+use rayon::prelude::*;
+
 use crate::common::{matvec_dd, matvec_id, matvec_ii, nint, MatD, MatI, Vec3I};
 use crate::grgrid::{double_grid_address, grid_address_from_index, grid_index_from_address};
 
@@ -424,4 +426,107 @@ pub fn rotate_bz_grid_index(
         }
         Ok(bz_map[gp as usize])
     }
+}
+
+/// Borrowed view onto a BZ grid: matches the fields read by C's
+/// `RecgridConstBZGrid` from `tpi_*` callsites.
+pub struct BzGridView<'a> {
+    pub d_diag: Vec3I,
+    pub addresses: &'a [Vec3I],
+    pub gp_map: &'a [i64],
+    /// 1 = sparse (gp_map indexes 2x mesh), 2 = dense (gp_map[g]..gp_map[g+1]).
+    pub bz_grid_type: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BzGridError {
+    /// `bz_grid_type` not 1 or 2.
+    BadGridType,
+    /// `tp_type` not 2, 3, or 4.
+    BadTpType,
+}
+
+/// Public: BZ-grid neighbours of many `grid_points` along a list of
+/// relative grid addresses.  Mirrors `ph3py_get_neighboring_gird_points`.  `out`
+/// is `num_grid_points * relative_grid_address.len()` long in row-major
+/// order: chunk `i` holds the neighbours of `grid_points[i]`.
+///
+/// Caller must ensure `out.len() == grid_points.len() * relative_grid_address.len()`.
+pub fn neighboring_grid_points_many(
+    out: &mut [i64],
+    grid_points: &[i64],
+    relative_grid_address: &[Vec3I],
+    bzgrid: &BzGridView,
+) -> Result<(), BzGridError> {
+    let num_rga = relative_grid_address.len();
+    out.par_chunks_mut(num_rga)
+        .zip(grid_points.par_iter())
+        .try_for_each(|(chunk, &gp)| {
+            fill_neighboring_grid_points(chunk, gp, relative_grid_address, bzgrid)
+        })
+}
+
+pub(crate) fn fill_neighboring_grid_points(
+    out: &mut [i64],
+    grid_point: i64,
+    relative_grid_address: &[Vec3I],
+    bzgrid: &BzGridView,
+) -> Result<(), BzGridError> {
+    match bzgrid.bz_grid_type {
+        1 => fill_neighboring_grid_points_type1(out, grid_point, relative_grid_address, bzgrid),
+        2 => fill_neighboring_grid_points_type2(out, grid_point, relative_grid_address, bzgrid),
+        _ => Err(BzGridError::BadGridType),
+    }
+}
+
+fn fill_neighboring_grid_points_type1(
+    out: &mut [i64],
+    grid_point: i64,
+    relative_grid_address: &[Vec3I],
+    bzgrid: &BzGridView,
+) -> Result<(), BzGridError> {
+    let bzmesh: Vec3I = [
+        bzgrid.d_diag[0] * 2,
+        bzgrid.d_diag[1] * 2,
+        bzgrid.d_diag[2] * 2,
+    ];
+    let prod_bz_mesh = bzmesh[0] * bzmesh[1] * bzmesh[2];
+    let base = bzgrid.addresses[grid_point as usize];
+
+    for (i, rel) in relative_grid_address.iter().enumerate() {
+        let bz_address: Vec3I = [base[0] + rel[0], base[1] + rel[1], base[2] + rel[2]];
+        let bz_gp = bzgrid.gp_map[grid_index_from_address(bz_address, bzmesh) as usize];
+        if bz_gp == prod_bz_mesh {
+            out[i] = grid_index_from_address(bz_address, bzgrid.d_diag);
+        } else {
+            out[i] = bz_gp;
+        }
+    }
+    Ok(())
+}
+
+fn fill_neighboring_grid_points_type2(
+    out: &mut [i64],
+    grid_point: i64,
+    relative_grid_address: &[Vec3I],
+    bzgrid: &BzGridView,
+) -> Result<(), BzGridError> {
+    let base = bzgrid.addresses[grid_point as usize];
+    for (i, rel) in relative_grid_address.iter().enumerate() {
+        let bz_address: Vec3I = [base[0] + rel[0], base[1] + rel[1], base[2] + rel[2]];
+        let gp = grid_index_from_address(bz_address, bzgrid.d_diag);
+        let lo = bzgrid.gp_map[gp as usize];
+        let hi = bzgrid.gp_map[(gp + 1) as usize];
+        out[i] = lo;
+        if hi - lo > 1 {
+            for j in lo..hi {
+                let a = bzgrid.addresses[j as usize];
+                if a == bz_address {
+                    out[i] = j;
+                    break;
+                }
+            }
+        }
+    }
+    Ok(())
 }

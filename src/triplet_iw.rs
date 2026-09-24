@@ -9,8 +9,8 @@
 
 use rayon::prelude::*;
 
+use crate::bzgrid::{fill_neighboring_grid_points, BzGridError, BzGridView};
 use crate::common::Vec3I;
-use crate::grgrid::grid_index_from_address;
 use crate::tetrahedron_method::{integration_weight, WeightFunction};
 
 /// `*mut T` wrapper opting into Send + Sync for rayon.  Used only inside
@@ -71,24 +71,6 @@ impl TpType {
             TpType::Type4 => 1,
         }
     }
-}
-
-/// Borrowed view onto a BZ grid: matches the fields read by C's
-/// `RecgridConstBZGrid` from `tpi_*` callsites.
-pub struct BzGridView<'a> {
-    pub d_diag: Vec3I,
-    pub addresses: &'a [Vec3I],
-    pub gp_map: &'a [i64],
-    /// 1 = sparse (gp_map indexes 2x mesh), 2 = dense (gp_map[g]..gp_map[g+1]).
-    pub bz_grid_type: i64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BzGridError {
-    /// `bz_grid_type` not 1 or 2.
-    BadGridType,
-    /// `tp_type` not 2, 3, or 4.
-    BadTpType,
 }
 
 /// Public: tetrahedron-method integration weights for a single triplet.
@@ -297,154 +279,6 @@ pub fn integration_weight_with_sigma_per_triplet_inner_par(
             }
         }
     });
-}
-
-/// Public: BZ-grid neighbours of `grid_point` along a list of relative
-/// grid addresses.  Mirrors `tpi_get_neighboring_grid_points`.
-///
-/// Returns one BZ grid index per relative address, in input order.
-pub fn neighboring_grid_points(
-    grid_point: i64,
-    relative_grid_address: &[Vec3I],
-    bzgrid: &BzGridView,
-) -> Result<Vec<i64>, BzGridError> {
-    let mut out = vec![0i64; relative_grid_address.len()];
-    fill_neighboring_grid_points(&mut out, grid_point, relative_grid_address, bzgrid)?;
-    Ok(out)
-}
-
-/// Public: parallel batch of `neighboring_grid_points` over many
-/// `grid_points`.  Mirrors `ph3py_get_neighboring_gird_points`.  `out`
-/// is `num_grid_points * relative_grid_address.len()` long in row-major
-/// order: chunk `i` holds the neighbours of `grid_points[i]`.
-///
-/// Caller must ensure `out.len() == grid_points.len() * relative_grid_address.len()`.
-pub fn neighboring_grid_points_many(
-    out: &mut [i64],
-    grid_points: &[i64],
-    relative_grid_address: &[Vec3I],
-    bzgrid: &BzGridView,
-) -> Result<(), BzGridError> {
-    let num_rga = relative_grid_address.len();
-    out.par_chunks_mut(num_rga)
-        .zip(grid_points.par_iter())
-        .try_for_each(|(chunk, &gp)| {
-            fill_neighboring_grid_points(chunk, gp, relative_grid_address, bzgrid)
-        })
-}
-
-/// Public: tetrahedron-method integration weights for many grid points.
-/// Mirrors `ph3py_get_thm_integration_weights_at_grid_points`.
-///
-/// `iw` is `(num_gp, num_fp, num_band)` in C-contiguous layout.
-/// `relative_grid_address` is the 24-tetrahedra vertex offset table,
-/// or several such tables concatenated, whose weights are averaged.
-/// `frequencies` is `(num_ir, num_band)` flat; `gp2irgp_map` maps each
-/// BZ-grid index to its row in `frequencies`.  Parallelised over grid
-/// points (output chunks are disjoint).
-pub fn integration_weights_at_grid_points(
-    iw: &mut [f64],
-    frequency_points: &[f64],
-    relative_grid_address: &[[Vec3I; 4]],
-    grid_points: &[i64],
-    frequencies: &[f64],
-    num_band: usize,
-    bzgrid: &BzGridView,
-    gp2irgp_map: &[i64],
-    function: WeightFunction,
-) -> Result<(), BzGridError> {
-    let num_fp = frequency_points.len();
-    let chunk_size = num_fp * num_band;
-    let num_tetra = relative_grid_address.len();
-
-    iw.par_chunks_mut(chunk_size)
-        .zip(grid_points.par_iter())
-        .try_for_each_init(
-            || (vec![[0i64; 4]; num_tetra], vec![[0.0f64; 4]; num_tetra]),
-            |(vertices, freq_vertices), (iw_chunk, &gp)| -> Result<(), BzGridError> {
-                for (j, tet) in relative_grid_address.iter().enumerate() {
-                    fill_neighboring_grid_points(&mut vertices[j], gp, tet, bzgrid)?;
-                }
-                for bi in 0..num_band {
-                    for j in 0..num_tetra {
-                        for k in 0..4 {
-                            let ir = gp2irgp_map[vertices[j][k] as usize] as usize;
-                            freq_vertices[j][k] = frequencies[ir * num_band + bi];
-                        }
-                    }
-                    for j in 0..num_fp {
-                        iw_chunk[j * num_band + bi] =
-                            integration_weight(frequency_points[j], freq_vertices, function);
-                    }
-                }
-                Ok(())
-            },
-        )
-}
-
-fn fill_neighboring_grid_points(
-    out: &mut [i64],
-    grid_point: i64,
-    relative_grid_address: &[Vec3I],
-    bzgrid: &BzGridView,
-) -> Result<(), BzGridError> {
-    match bzgrid.bz_grid_type {
-        1 => fill_neighboring_grid_points_type1(out, grid_point, relative_grid_address, bzgrid),
-        2 => fill_neighboring_grid_points_type2(out, grid_point, relative_grid_address, bzgrid),
-        _ => Err(BzGridError::BadGridType),
-    }
-}
-
-fn fill_neighboring_grid_points_type1(
-    out: &mut [i64],
-    grid_point: i64,
-    relative_grid_address: &[Vec3I],
-    bzgrid: &BzGridView,
-) -> Result<(), BzGridError> {
-    let bzmesh: Vec3I = [
-        bzgrid.d_diag[0] * 2,
-        bzgrid.d_diag[1] * 2,
-        bzgrid.d_diag[2] * 2,
-    ];
-    let prod_bz_mesh = bzmesh[0] * bzmesh[1] * bzmesh[2];
-    let base = bzgrid.addresses[grid_point as usize];
-
-    for (i, rel) in relative_grid_address.iter().enumerate() {
-        let bz_address: Vec3I = [base[0] + rel[0], base[1] + rel[1], base[2] + rel[2]];
-        let bz_gp = bzgrid.gp_map[grid_index_from_address(bz_address, bzmesh) as usize];
-        if bz_gp == prod_bz_mesh {
-            out[i] = grid_index_from_address(bz_address, bzgrid.d_diag);
-        } else {
-            out[i] = bz_gp;
-        }
-    }
-    Ok(())
-}
-
-fn fill_neighboring_grid_points_type2(
-    out: &mut [i64],
-    grid_point: i64,
-    relative_grid_address: &[Vec3I],
-    bzgrid: &BzGridView,
-) -> Result<(), BzGridError> {
-    let base = bzgrid.addresses[grid_point as usize];
-    for (i, rel) in relative_grid_address.iter().enumerate() {
-        let bz_address: Vec3I = [base[0] + rel[0], base[1] + rel[1], base[2] + rel[2]];
-        let gp = grid_index_from_address(bz_address, bzgrid.d_diag);
-        let lo = bzgrid.gp_map[gp as usize];
-        let hi = bzgrid.gp_map[(gp + 1) as usize];
-        out[i] = lo;
-        if hi - lo > 1 {
-            for j in lo..hi {
-                let a = bzgrid.addresses[j as usize];
-                if a == bz_address {
-                    out[i] = j;
-                    break;
-                }
-            }
-        }
-    }
-    Ok(())
 }
 
 /// Build the `[2][24][4]` per-channel BZ-grid vertex indices for a
