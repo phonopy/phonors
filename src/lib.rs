@@ -8,7 +8,7 @@ use numpy::{
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 
-use crate::common::Cmplx;
+use crate::common::{Cmplx, Vec3I};
 
 mod bzgrid;
 mod cells;
@@ -2431,6 +2431,27 @@ fn relative_grid_address_3d(arr: &PyReadonlyArray3<i64>) -> PyResult<RelativeGri
     }
     let mut out: RelativeGridAddress = [[[0i64; 3]; 4]; 24];
     for i in 0..24 {
+        for j in 0..4 {
+            for k in 0..3 {
+                out[i][j][k] = v[[i, j, k]];
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Read a `(24 * n, 4, 3)` table: `n` sets of 24 tetrahedra, whose
+/// weights are averaged.
+fn relative_grid_addresses(arr: &PyReadonlyArray3<i64>) -> PyResult<Vec<[Vec3I; 4]>> {
+    let v = arr.as_array();
+    let shape = v.shape();
+    if shape[0] == 0 || shape[0] % 24 != 0 || shape[1..] != [4, 3] {
+        return Err(PyValueError::new_err(
+            "relative_grid_address must have shape (24 * n, 4, 3)",
+        ));
+    }
+    let mut out = vec![[[0i64; 3]; 4]; shape[0]];
+    for i in 0..shape[0] {
         for j in 0..4 {
             for k in 0..3 {
                 out[i][j][k] = v[[i, j, k]];
@@ -5924,7 +5945,7 @@ fn py_integration_weights_at_grid_points<'py>(
         "J" => WeightFunction::J,
         _ => return Err(PyValueError::new_err("function must be 'I' or 'J'")),
     };
-    let rga = relative_grid_address_3d(&relative_grid_address)?;
+    let rga = relative_grid_addresses(&relative_grid_address)?;
     let adrs = addresses_i(&bz_grid_addresses)?;
     let d = vec3_i(&d_diag)?;
 
