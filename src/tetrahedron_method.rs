@@ -8,6 +8,9 @@
 
 #![allow(dead_code)]
 
+use rayon::prelude::*;
+
+use crate::bzgrid::{fill_neighboring_grid_points, BzGridError, BzGridView};
 use crate::common::{matvec_di, MatD, Vec3D, Vec3I};
 
 /// `THM_EPSILON=1e-10` is unconditionally set in `CMakeLists.txt`
@@ -227,6 +230,55 @@ fn get_integration_weight(
     }
     // 6.0 for 24 tetrahedra, so that case is unchanged bit for bit.
     sum / (tetrahedra_omegas.len() as f64 / 4.0)
+}
+
+/// Public: tetrahedron-method integration weights for many grid points.
+/// Mirrors `ph3py_get_thm_integration_weights_at_grid_points`.
+///
+/// `iw` is `(num_gp, num_fp, num_band)` in C-contiguous layout.
+/// `relative_grid_address` is the 24-tetrahedra vertex offset table,
+/// or several such tables concatenated, whose weights are averaged.
+/// `frequencies` is `(num_ir, num_band)` flat; `gp2irgp_map` maps each
+/// BZ-grid index to its row in `frequencies`.  Parallelised over grid
+/// points (output chunks are disjoint).
+pub fn integration_weights_at_grid_points(
+    iw: &mut [f64],
+    frequency_points: &[f64],
+    relative_grid_address: &[[Vec3I; 4]],
+    grid_points: &[i64],
+    frequencies: &[f64],
+    num_band: usize,
+    bzgrid: &BzGridView,
+    gp2irgp_map: &[i64],
+    function: WeightFunction,
+) -> Result<(), BzGridError> {
+    let num_fp = frequency_points.len();
+    let chunk_size = num_fp * num_band;
+    let num_tetra = relative_grid_address.len();
+
+    iw.par_chunks_mut(chunk_size)
+        .zip(grid_points.par_iter())
+        .try_for_each_init(
+            || (vec![[0i64; 4]; num_tetra], vec![[0.0f64; 4]; num_tetra]),
+            |(vertices, freq_vertices), (iw_chunk, &gp)| -> Result<(), BzGridError> {
+                for (j, tet) in relative_grid_address.iter().enumerate() {
+                    fill_neighboring_grid_points(&mut vertices[j], gp, tet, bzgrid)?;
+                }
+                for bi in 0..num_band {
+                    for j in 0..num_tetra {
+                        for k in 0..4 {
+                            let ir = gp2irgp_map[vertices[j][k] as usize] as usize;
+                            freq_vertices[j][k] = frequencies[ir * num_band + bi];
+                        }
+                    }
+                    for j in 0..num_fp {
+                        iw_chunk[j * num_band + bi] =
+                            integration_weight(frequency_points[j], freq_vertices, function);
+                    }
+                }
+                Ok(())
+            },
+        )
 }
 
 /// Sort `v` ascending in place; return the case index `ci ∈ {0,1,2,3}`

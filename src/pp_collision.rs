@@ -12,14 +12,14 @@ use std::cell::RefCell;
 
 use rayon::prelude::*;
 
+use crate::bzgrid::{BzGridError, BzGridView};
 use crate::common::Cmplx;
 use crate::imag_self_energy::imag_self_energy_at_triplet;
 use crate::interaction::{get_interaction_at_triplet, InteractionScratch};
 use crate::real_to_reciprocal::AtomTriplets;
 use crate::triplet::{is_n, set_relative_grid_address, RelativeGridAddress};
 use crate::triplet_iw::{
-    integration_weight_per_triplet, integration_weight_with_sigma_per_triplet, BzGridError,
-    BzGridView, TpType,
+    integration_weight_per_triplet, integration_weight_with_sigma_per_triplet, TpType,
 };
 
 /// Scratch buffers reused across triplets to avoid per-triplet heap

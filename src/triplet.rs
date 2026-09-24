@@ -10,11 +10,12 @@
 
 use rayon::prelude::*;
 
+use crate::bzgrid::{BzGridError, BzGridView};
 use crate::common::Vec3I;
 use crate::triplet_iw::{
     integration_weight_per_triplet, integration_weight_per_triplet_inner_par,
     integration_weight_with_sigma_per_triplet, integration_weight_with_sigma_per_triplet_inner_par,
-    BzGridError, BzGridView, TpType,
+    TpType,
 };
 
 /// Tetrahedron-method relative addresses: 24 tetrahedra,

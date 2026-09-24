@@ -37,14 +37,14 @@ mod triplet;
 mod triplet_grid;
 mod triplet_iw;
 
-use bzgrid::{BzGridAddressesError, RotateBzGridError};
+use bzgrid::{BzGridAddressesError, BzGridError, BzGridView, RotateBzGridError};
 use recip_rotations::ReciprocalRotationsError;
 use snf3x3::Snf3x3Error;
 use tetrahedron_method::WeightFunction;
 use transform_rotations::TransformRotationsError;
 use triplet::RelativeGridAddress;
 use triplet_grid::BzTripletsError;
-use triplet_iw::{BzGridError, BzGridView, TpType};
+use triplet_iw::TpType;
 
 // ---------------------------------------------------------------
 // Boundary conversion helpers (numpy <-> fixed-size Rust arrays)
@@ -5916,7 +5916,7 @@ fn py_neighboring_grid_points<'py>(
             gp_map: bzmap_slice,
             bz_grid_type,
         };
-        triplet_iw::neighboring_grid_points_many(out, gp_slice, &rga, &bzgrid)
+        bzgrid::neighboring_grid_points_many(out, gp_slice, &rga, &bzgrid)
     })
     .map_err(|e| match e {
         BzGridError::BadGridType => PyValueError::new_err("bz_grid_type must be 1 or 2"),
@@ -5988,7 +5988,7 @@ fn py_integration_weights_at_grid_points<'py>(
             gp_map: bzmap_slice,
             bz_grid_type,
         };
-        triplet_iw::integration_weights_at_grid_points(
+        tetrahedron_method::integration_weights_at_grid_points(
             iw_slice,
             fp_slice,
             &rga,
