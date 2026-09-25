@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-09-25
+
+### Changed
+- `integration_weights_at_grid_points`, `triplets_integration_weights`,
+  `pp_collision`, `collision_at_grid_point`, and
+  `collision_at_grid_points_batched` now accept `relative_grid_address` of
+  shape `(24 * n, 4, 3)`, i.e., `n` concatenated sets of 24 tetrahedra, and
+  average the tetrahedron-method weights over the sets. The previous
+  `(24, 4, 3)` input is the `n = 1` case and behaves as before.
+
 ## [0.3.0] - 2026-06-27
 
 ### Added
@@ -54,7 +64,8 @@ Initial public release.  Provides the Rust kernel set used by
 `abi3-py310` wheels for Linux x86_64 / aarch64, macOS x86_64 /
 arm64, and Windows x86_64.
 
-[Unreleased]: https://github.com/phonopy/phonors/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/phonopy/phonors/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/phonopy/phonors/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/phonopy/phonors/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/phonopy/phonors/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/phonopy/phonors/compare/v0.1.2...v0.2.0
