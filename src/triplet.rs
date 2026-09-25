@@ -15,7 +15,7 @@ use crate::common::Vec3I;
 use crate::triplet_iw::{
     integration_weight_per_triplet, integration_weight_per_triplet_inner_par,
     integration_weight_with_sigma_per_triplet, integration_weight_with_sigma_per_triplet_inner_par,
-    TpType,
+    TpRelativeGridAddress, TpType,
 };
 
 /// Tetrahedron-method relative addresses: 24 tetrahedra,
@@ -47,14 +47,21 @@ pub fn is_n(triplet: [i64; 3], bz_grid_addresses: &[Vec3I]) -> bool {
 ///   - channel 1 uses negated addresses when `tp_type` is 2 or 3
 ///     (the q1+q2+q3=G branch where q3 must shift opposite to q2);
 ///     otherwise it uses the unchanged addresses (tp_type == 4 case).
+///
+/// `relative_grid_address` holds 24 tetrahedra, or several sets of 24
+/// concatenated.
 pub fn set_relative_grid_address(
-    relative_grid_address: &RelativeGridAddress,
+    relative_grid_address: &[[Vec3I; 4]],
     tp_type: i64,
-) -> [RelativeGridAddress; 2] {
+) -> TpRelativeGridAddress {
     let sign1: i64 = if tp_type == 2 || tp_type == 3 { -1 } else { 1 };
 
-    let mut out = [[[[0i64; 3]; 4]; 24]; 2];
-    for j in 0..24 {
+    let num_tetra = relative_grid_address.len();
+    let mut out: TpRelativeGridAddress = [
+        vec![[[0i64; 3]; 4]; num_tetra],
+        vec![[[0i64; 3]; 4]; num_tetra],
+    ];
+    for j in 0..num_tetra {
         for k in 0..4 {
             for l in 0..3 {
                 let v = relative_grid_address[j][k][l];
@@ -87,7 +94,7 @@ pub fn integration_weight(
     iw: &mut [f64],
     iw_zero: &mut [i8],
     frequency_points: &[f64],
-    relative_grid_address: &RelativeGridAddress,
+    relative_grid_address: &[[Vec3I; 4]],
     triplets: &[[i64; 3]],
     bzgrid: &BzGridView,
     frequencies1: &[f64],
@@ -299,5 +306,16 @@ mod tests {
         let out = set_relative_grid_address(&input, 4);
         assert_eq!(out[0][1][1], [4, -5, 6]);
         assert_eq!(out[1][1][1], [4, -5, 6]);
+    }
+
+    #[test]
+    fn set_relative_grid_address_keeps_all_sets() {
+        let mut input = vec![[[0i64; 3]; 4]; 48];
+        input[30][2] = [1, -2, 3];
+        let out = set_relative_grid_address(&input, 2);
+        assert_eq!(out[0].len(), 48);
+        assert_eq!(out[1].len(), 48);
+        assert_eq!(out[0][30][2], [1, -2, 3]);
+        assert_eq!(out[1][30][2], [-1, 2, -3]);
     }
 }

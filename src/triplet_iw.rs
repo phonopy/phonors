@@ -34,9 +34,25 @@ impl<T> SyncMutPtr<T> {
 const INV_SQRT_2PI: f64 = 0.398_942_280_401_432_7;
 
 /// Per-channel relative grid addresses: 2 sign channels (q2, q3),
-/// 24 tetrahedra, 4 vertices, 3 spatial components.  Built by
+/// 24 * n tetrahedra, 4 vertices, 3 spatial components.  Built by
 /// `triplet::set_relative_grid_address`.
-pub type TpRelativeGridAddress = [[[Vec3I; 4]; 24]; 2];
+pub type TpRelativeGridAddress = [Vec<[Vec3I; 4]>; 2];
+
+/// BZ-grid indices of the tetrahedron vertices of a triplet, per
+/// channel: `[2][num_tetra][4]`.
+type TpVertices = [Vec<[i64; 4]>; 2];
+
+/// Frequencies at the tetrahedron vertices of one band pair, per
+/// channel: `[3][num_tetra][4]`.
+type FreqVertices = [Vec<[f64; 4]>; 3];
+
+fn new_freq_vertices(num_tetra: usize) -> FreqVertices {
+    [
+        vec![[0.0f64; 4]; num_tetra],
+        vec![[0.0f64; 4]; num_tetra],
+        vec![[0.0f64; 4]; num_tetra],
+    ]
+}
 
 /// Triplet integration-weight type.
 ///
@@ -100,12 +116,14 @@ pub fn integration_weight_per_triplet(
     let nb0 = num_band0 as usize;
 
     let vertices = triplet_tetrahedra_vertices(tp_relative_grid_address, triplet, bzgrid)?;
+    let mut freq_vertices = new_freq_vertices(vertices[0].len());
 
     let max_i = max_tetra_channels(tp_type);
     for b12 in 0..nbb {
         let b1 = (b12 as i64) / num_band2;
         let b2 = (b12 as i64) % num_band2;
-        let freq_vertices = build_freq_vertices(
+        build_freq_vertices(
+            &mut freq_vertices,
             &vertices,
             frequencies1,
             frequencies2,
@@ -165,32 +183,37 @@ pub fn integration_weight_per_triplet_inner_par(
     // iw_zero.  These index sets are pairwise disjoint across different
     // b12 values, so concurrent writes from different rayon tasks do not
     // race.  Slice lengths are nb0 * nbb so all offsets are in-bounds.
-    (0..nbb).into_par_iter().for_each(|b12| {
-        let b1 = (b12 as i64) / num_band2;
-        let b2 = (b12 as i64) % num_band2;
-        let freq_vertices = build_freq_vertices(
-            &vertices,
-            frequencies1,
-            frequencies2,
-            num_band1,
-            num_band2,
-            b1,
-            b2,
-            tp_type,
-        );
-        let bboxes = freq_vertices_bboxes(&freq_vertices, max_i);
-        for j in 0..nb0 {
-            let adrs = j * nbb + b12;
-            let f0 = frequency_points[j];
-            let (ch, iwz) = compute_tetra_channels(f0, &freq_vertices, &bboxes, tp_type);
-            unsafe {
-                *iwz_ptr.ptr().add(adrs) = iwz;
-                for (k, ch_ptr) in ch_ptrs.iter().enumerate() {
-                    *ch_ptr.ptr().add(adrs) = ch[k];
+    let num_tetra = vertices[0].len();
+    (0..nbb).into_par_iter().for_each_init(
+        || new_freq_vertices(num_tetra),
+        |freq_vertices, b12| {
+            let b1 = (b12 as i64) / num_band2;
+            let b2 = (b12 as i64) % num_band2;
+            build_freq_vertices(
+                freq_vertices,
+                &vertices,
+                frequencies1,
+                frequencies2,
+                num_band1,
+                num_band2,
+                b1,
+                b2,
+                tp_type,
+            );
+            let bboxes = freq_vertices_bboxes(freq_vertices, max_i);
+            for j in 0..nb0 {
+                let adrs = j * nbb + b12;
+                let f0 = frequency_points[j];
+                let (ch, iwz) = compute_tetra_channels(f0, freq_vertices, &bboxes, tp_type);
+                unsafe {
+                    *iwz_ptr.ptr().add(adrs) = iwz;
+                    for (k, ch_ptr) in ch_ptrs.iter().enumerate() {
+                        *ch_ptr.ptr().add(adrs) = ch[k];
+                    }
                 }
             }
-        }
-    });
+        },
+    );
 
     Ok(())
 }
@@ -281,37 +304,37 @@ pub fn integration_weight_with_sigma_per_triplet_inner_par(
     });
 }
 
-/// Build the `[2][24][4]` per-channel BZ-grid vertex indices for a
-/// triplet.  Mirrors `get_triplet_tetrahedra_vertices`.
+/// Build the `[2][num_tetra][4]` per-channel BZ-grid vertex indices for
+/// a triplet.  Mirrors `get_triplet_tetrahedra_vertices`.
 fn triplet_tetrahedra_vertices(
     tp_relative_grid_address: &TpRelativeGridAddress,
     triplet: [i64; 3],
     bzgrid: &BzGridView,
-) -> Result<[[[i64; 4]; 24]; 2], BzGridError> {
-    let mut vertices = [[[0i64; 4]; 24]; 2];
+) -> Result<TpVertices, BzGridError> {
+    let num_tetra = tp_relative_grid_address[0].len();
+    let mut vertices: TpVertices = [vec![[0i64; 4]; num_tetra], vec![[0i64; 4]; num_tetra]];
     for i in 0..2 {
-        for j in 0..24 {
-            let mut row = [0i64; 4];
+        for j in 0..num_tetra {
             fill_neighboring_grid_points(
-                &mut row,
+                &mut vertices[i][j],
                 triplet[i + 1],
                 &tp_relative_grid_address[i][j],
                 bzgrid,
             )?;
-            vertices[i][j] = row;
         }
     }
     Ok(vertices)
 }
 
-/// Build the `[3][24][4]` per-channel frequency vertices for a single
-/// `(b1, b2)` band pair.  Mirrors `set_freq_vertices`.
+/// Fill the `[3][num_tetra][4]` per-channel frequency vertices for a
+/// single `(b1, b2)` band pair.  Mirrors `set_freq_vertices`.
 ///
 /// For Type2/Type3 the three channels are `-f1+f2`, `f1-f2`,
 /// `f1+f2` (negative input frequencies are clamped to 0).
 /// For Type4 only channel 0 (`-f1+f2`) is populated.
 fn build_freq_vertices(
-    vertices: &[[[i64; 4]; 24]; 2],
+    out: &mut FreqVertices,
+    vertices: &TpVertices,
     frequencies1: &[f64],
     frequencies2: &[f64],
     num_band1: i64,
@@ -319,9 +342,8 @@ fn build_freq_vertices(
     b1: i64,
     b2: i64,
     tp_type: TpType,
-) -> [[[f64; 4]; 24]; 3] {
-    let mut out = [[[0.0f64; 4]; 24]; 3];
-    for i in 0..24 {
+) {
+    for i in 0..vertices[0].len() {
         for j in 0..4 {
             let mut f1 = frequencies1[(vertices[0][i][j] * num_band1 + b1) as usize];
             let mut f2 = frequencies2[(vertices[1][i][j] * num_band2 + b2) as usize];
@@ -343,7 +365,6 @@ fn build_freq_vertices(
             }
         }
     }
-    out
 }
 
 /// Number of tetrahedron channels to compute for a given `tp_type`.
@@ -354,16 +375,16 @@ fn max_tetra_channels(tp_type: TpType) -> usize {
     }
 }
 
-/// Per-channel (fmin, fmax) bounding boxes across the 24 tetrahedra's
+/// Per-channel (fmin, fmax) bounding boxes across the tetrahedra's
 /// 4 vertices.  Only the first `max_i` entries are populated.  Hoisted
 /// out of the `f0` loop so the per-`f0` in-tetrahedron test reduces
-/// from a 96-entry min/max scan to a pair of comparisons.
-fn freq_vertices_bboxes(freq_vertices: &[[[f64; 4]; 24]; 3], max_i: usize) -> [(f64, f64); 3] {
+/// from a min/max scan over all vertices to a pair of comparisons.
+fn freq_vertices_bboxes(freq_vertices: &FreqVertices, max_i: usize) -> [(f64, f64); 3] {
     let mut out = [(0.0f64, 0.0f64); 3];
     for i in 0..max_i {
         let mut fmin = freq_vertices[i][0][0];
         let mut fmax = freq_vertices[i][0][0];
-        for j in 0..24 {
+        for j in 0..freq_vertices[i].len() {
             for k in 0..4 {
                 let v = freq_vertices[i][j][k];
                 if fmin > v {
@@ -385,7 +406,7 @@ fn freq_vertices_bboxes(freq_vertices: &[[[f64; 4]; 24]; 3], max_i: usize) -> [(
 /// where `iw_zero == 1` means every populated `g[i]` is exactly zero.
 fn compute_g(
     f0: f64,
-    freq_vertices: &[[[f64; 4]; 24]; 3],
+    freq_vertices: &FreqVertices,
     bboxes: &[(f64, f64); 3],
     max_i: usize,
 ) -> ([f64; 3], i8) {
@@ -409,7 +430,7 @@ fn compute_g(
 /// trailing entries are 0.0 padding.  No side effects.
 fn compute_tetra_channels(
     f0: f64,
-    freq_vertices: &[[[f64; 4]; 24]; 3],
+    freq_vertices: &FreqVertices,
     bboxes: &[(f64, f64); 3],
     tp_type: TpType,
 ) -> ([f64; 3], i8) {
@@ -538,5 +559,32 @@ mod tests {
         );
         assert_eq!(iw, vec![0.0]);
         assert_eq!(iw_zero[0], 1);
+    }
+
+    #[test]
+    fn tetra_channels_of_repeated_set_are_unchanged() {
+        // Two copies of the same 24 tetrahedra give the channels of one.
+        let mut single = new_freq_vertices(24);
+        for (i, channel) in single.iter_mut().enumerate() {
+            for (j, tetra) in channel.iter_mut().enumerate() {
+                let x = (i * 24 + j) as f64;
+                *tetra = [x.sin(), 1.0 + x.cos(), 0.5 * (2.0 * x).sin(), 2.0 - x.cos()];
+            }
+        }
+        let doubled: FreqVertices =
+            std::array::from_fn(|i| single[i].iter().chain(single[i].iter()).copied().collect());
+        let bb_single = freq_vertices_bboxes(&single, 3);
+        let bb_doubled = freq_vertices_bboxes(&doubled, 3);
+        assert_eq!(bb_single, bb_doubled);
+        for f0 in [-1.0, 0.2, 0.9, 1.6, 3.5] {
+            for tp in [TpType::Type2, TpType::Type3, TpType::Type4] {
+                let (ch1, z1) = compute_tetra_channels(f0, &single, &bb_single, tp);
+                let (ch2, z2) = compute_tetra_channels(f0, &doubled, &bb_doubled, tp);
+                assert_eq!(z1, z2);
+                for k in 0..3 {
+                    assert!((ch1[k] - ch2[k]).abs() < 1e-14, "{f0} {tp:?} {k}");
+                }
+            }
+        }
     }
 }

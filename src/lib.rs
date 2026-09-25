@@ -443,7 +443,7 @@ fn py_triplets_integration_weights<'py>(
 ) -> PyResult<()> {
     let tp = TpType::try_from_i64(tp_type)
         .map_err(|_| PyValueError::new_err("tp_type must be 2, 3, or 4"))?;
-    let rga = relative_grid_address_3d(&relative_grid_address)?;
+    let rga = relative_grid_addresses(&relative_grid_address)?;
     let trip = addresses_i(&triplets)?;
     let adrs = addresses_i(&bz_grid_addresses)?;
     let bzmap_view = bz_map.as_array();
