@@ -42,7 +42,6 @@ use recip_rotations::ReciprocalRotationsError;
 use snf3x3::Snf3x3Error;
 use tetrahedron_method::WeightFunction;
 use transform_rotations::TransformRotationsError;
-use triplet::RelativeGridAddress;
 use triplet_grid::BzTripletsError;
 use triplet_iw::TpType;
 
@@ -2422,24 +2421,6 @@ fn py_reciprocal_to_normal_squared<'py>(
     Ok(())
 }
 
-fn relative_grid_address_3d(arr: &PyReadonlyArray3<i64>) -> PyResult<RelativeGridAddress> {
-    let v = arr.as_array();
-    if v.shape() != [24, 4, 3] {
-        return Err(PyValueError::new_err(
-            "relative_grid_address must have shape (24, 4, 3)",
-        ));
-    }
-    let mut out: RelativeGridAddress = [[[0i64; 3]; 4]; 24];
-    for i in 0..24 {
-        for j in 0..4 {
-            for k in 0..3 {
-                out[i][j][k] = v[[i, j, k]];
-            }
-        }
-    }
-    Ok(out)
-}
-
 /// Read a `(24 * n, 4, 3)` table: `n` sets of 24 tetrahedra, whose
 /// weights are averaged.
 fn relative_grid_addresses(arr: &PyReadonlyArray3<i64>) -> PyResult<Vec<[Vec3I; 4]>> {
@@ -3117,7 +3098,7 @@ fn py_pp_collision<'py>(
             "collisions shape must be (num_temps, num_band0) or (2, num_temps, num_band0)",
         ));
     }
-    let rga = relative_grid_address_3d(&relative_grid_address)?;
+    let rga = relative_grid_addresses(&relative_grid_address)?;
     let d3 = vec3_i(&d_diag)?;
     let q3 = mat3_i(&q_mat)?;
 
@@ -3566,7 +3547,7 @@ fn py_collision_at_grid_point<'py>(
              (num_sigma, 2, num_temps, num_band0)",
         ));
     }
-    let rga = relative_grid_address_3d(&relative_grid_address)?;
+    let rga = relative_grid_addresses(&relative_grid_address)?;
     let d3 = vec3_i(&d_diag)?;
     let q3 = mat3_i(&q_mat)?;
     let bz_trip_q = mat3_i(&bz_triplets_q_mat)?;
@@ -3922,7 +3903,7 @@ fn py_collision_at_grid_points_batched<'py>(
              or (num_gp_batch, num_sigma, 2, num_temps, num_band0)",
         ));
     }
-    let rga = relative_grid_address_3d(&relative_grid_address)?;
+    let rga = relative_grid_addresses(&relative_grid_address)?;
     let d3 = vec3_i(&d_diag)?;
     let q3 = mat3_i(&q_mat)?;
     let bz_trip_q = mat3_i(&bz_triplets_q_mat)?;

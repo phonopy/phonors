@@ -13,11 +13,11 @@ use std::cell::RefCell;
 use rayon::prelude::*;
 
 use crate::bzgrid::{BzGridError, BzGridView};
-use crate::common::Cmplx;
+use crate::common::{Cmplx, Vec3I};
 use crate::imag_self_energy::imag_self_energy_at_triplet;
 use crate::interaction::{get_interaction_at_triplet, InteractionScratch};
 use crate::real_to_reciprocal::AtomTriplets;
-use crate::triplet::{is_n, set_relative_grid_address, RelativeGridAddress};
+use crate::triplet::{is_n, set_relative_grid_address};
 use crate::triplet_iw::{
     integration_weight_per_triplet, integration_weight_with_sigma_per_triplet, TpType,
 };
@@ -236,7 +236,7 @@ fn finalize(
 #[allow(clippy::too_many_arguments)]
 pub fn get_pp_collision(
     collisions: &mut [f64],
-    relative_grid_address: &RelativeGridAddress,
+    relative_grid_address: &[[Vec3I; 4]],
     frequencies: &[f64],
     eigenvectors: &[Cmplx],
     triplets: &[[i64; 3]],
@@ -476,7 +476,7 @@ pub fn get_pp_collision_multi_gp(
     collisions_per_gp: &mut [&mut [f64]],
     triplets_per_gp: &[&[[i64; 3]]],
     triplet_weights_per_gp: &[&[i64]],
-    relative_grid_address: &RelativeGridAddress,
+    relative_grid_address: &[[Vec3I; 4]],
     frequencies: &[f64],
     eigenvectors: &[Cmplx],
     bzgrid: &BzGridView<'_>,

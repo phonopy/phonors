@@ -18,10 +18,6 @@ use crate::triplet_iw::{
     TpRelativeGridAddress, TpType,
 };
 
-/// Tetrahedron-method relative addresses: 24 tetrahedra,
-/// 4 vertices each, 3 spatial components.
-pub type RelativeGridAddress = [[Vec3I; 4]; 24];
-
 /// Test whether a triplet is a normal (N) process: the sum of the
 /// three BZ grid addresses is zero in every component.
 ///
