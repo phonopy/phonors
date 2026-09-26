@@ -12,6 +12,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `grid_indices_from_addresses`, which takes addresses of shape `(n, 3)` and
   returns their GR grid-point indices.
 
+### Fixed
+- The tetrahedron-method integration weight at a frequency point exactly
+  equal to a vertex frequency was zero. It is now the limit from above, so the
+  weight is continuous there. This changes, e.g., isotope scattering rates,
+  whose frequency points are the frequencies of the grid point itself.
+
 ## [0.4.0] - 2026-09-25
 
 ### Changed
