@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-09-26
+
 ### Changed
 - `grid_index_from_address`, which took a single address, is replaced by
   `grid_indices_from_addresses`, which takes addresses of shape `(n, 3)` and
@@ -75,7 +77,8 @@ Initial public release.  Provides the Rust kernel set used by
 `abi3-py310` wheels for Linux x86_64 / aarch64, macOS x86_64 /
 arm64, and Windows x86_64.
 
-[Unreleased]: https://github.com/phonopy/phonors/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/phonopy/phonors/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/phonopy/phonors/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/phonopy/phonors/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/phonopy/phonors/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/phonopy/phonors/compare/v0.2.0...v0.2.1
