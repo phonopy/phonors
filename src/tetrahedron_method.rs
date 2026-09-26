@@ -213,18 +213,17 @@ fn get_integration_weight(
     for tetra_omegas in tetrahedra_omegas {
         let mut v = *tetra_omegas;
         let ci = sort_omegas(&mut v);
-        // The chained `else if` exactly preserves the C code's
-        // strict-inequality guards: at boundary equality (e.g.
-        // omega == v[0]) no branch contributes.
+        // omega equal to a vertex goes to the branch above it, whose
+        // value there is the limit from above.
         if omega < v[0] {
             sum += ij(0, ci, omega, &v) * gn(0, omega, &v);
-        } else if v[0] < omega && omega < v[1] {
+        } else if omega < v[1] {
             sum += ij(1, ci, omega, &v) * gn(1, omega, &v);
-        } else if v[1] < omega && omega < v[2] {
+        } else if omega < v[2] {
             sum += ij(2, ci, omega, &v) * gn(2, omega, &v);
-        } else if v[2] < omega && omega < v[3] {
+        } else if omega < v[3] {
             sum += ij(3, ci, omega, &v) * gn(3, omega, &v);
-        } else if v[3] < omega {
+        } else {
             sum += ij(4, ci, omega, &v) * gn(4, omega, &v);
         }
     }
@@ -758,6 +757,30 @@ mod tests {
                 let w24 = integration_weight(omega, &to, wf);
                 let w48 = integration_weight(omega, &doubled, wf);
                 assert!((w24 - w48).abs() < 1e-14, "{omega} {wf:?}: {w24} {w48}");
+            }
+        }
+    }
+
+    #[test]
+    fn integration_weight_is_continuous_at_a_vertex() {
+        // omega equal to the central vertex, as for the frequency of the
+        // grid point itself, gives the weight of omega just beside it.
+        let mut to = [[0.0; 4]; 24];
+        for i in 0..24 {
+            let x = i as f64;
+            to[i] = [
+                1.0,
+                1.0 + x.sin(),
+                1.5 + 0.5 * (2.0 * x).cos(),
+                0.8 - 0.3 * x.cos(),
+            ];
+        }
+        for wf in [WeightFunction::I, WeightFunction::J] {
+            let w = integration_weight(1.0, &to, wf);
+            assert!(w > 0.0, "{wf:?}");
+            for omega in [1.0 - 1e-12, 1.0 + 1e-12] {
+                let w_beside = integration_weight(omega, &to, wf);
+                assert!((w - w_beside).abs() < 1e-9, "{wf:?}: {w} {w_beside}");
             }
         }
     }
