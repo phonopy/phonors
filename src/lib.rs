@@ -182,20 +182,23 @@ fn py_snf3x3<'py>(
     }
 }
 
-/// Return the GR grid-point index of a single grid address.
+/// Return the GR grid-point indices of ``(n, 3)`` grid addresses.
 ///
-/// ``address`` components are reduced to ``[0, d_diag[i])`` before
-/// the index is computed.
+/// The components of each address are reduced to ``[0, d_diag[i])``
+/// before the index is computed.
 #[pyfunction]
-#[pyo3(name = "grid_index_from_address")]
-fn py_grid_index_from_address(
-    address: PyReadonlyArray1<i64>,
-    d_diag: PyReadonlyArray1<i64>,
-) -> PyResult<i64> {
-    Ok(grgrid::grid_index_from_address(
-        vec3_i(&address)?,
-        vec3_i(&d_diag)?,
-    ))
+#[pyo3(name = "grid_indices_from_addresses")]
+fn py_grid_indices_from_addresses<'py>(
+    py: Python<'py>,
+    addresses: PyReadonlyArray2<'py, i64>,
+    d_diag: PyReadonlyArray1<'py, i64>,
+) -> PyResult<Bound<'py, PyArray1<i64>>> {
+    let d = vec3_i(&d_diag)?;
+    let gps: Vec<i64> = addresses_i(&addresses)?
+        .into_iter()
+        .map(|adrs| grgrid::grid_index_from_address(adrs, d))
+        .collect();
+    Ok(gps.into_pyarray(py))
 }
 
 /// Return all GR-grid addresses as a ``(prod(d_diag), 3)`` array.
@@ -6441,7 +6444,7 @@ fn py_eigvalsh_values_batch<'py>(
 #[pymodule(gil_used = false)]
 fn phonors(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_snf3x3, m)?)?;
-    m.add_function(wrap_pyfunction!(py_grid_index_from_address, m)?)?;
+    m.add_function(wrap_pyfunction!(py_grid_indices_from_addresses, m)?)?;
     m.add_function(wrap_pyfunction!(py_gr_grid_addresses, m)?)?;
     m.add_function(wrap_pyfunction!(py_ir_grid_map, m)?)?;
     m.add_function(wrap_pyfunction!(py_reciprocal_rotations, m)?)?;
