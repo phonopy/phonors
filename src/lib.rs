@@ -49,6 +49,27 @@ use triplet_iw::TpType;
 // Boundary conversion helpers (numpy <-> fixed-size Rust arrays)
 // ---------------------------------------------------------------
 
+/// Borrow optional ``degenerate_ids`` as a flat slice, checking that it
+/// has the shape of ``frequencies``, ``(num_grid, num_band)``.
+fn degenerate_ids_slice<'a>(
+    degenerate_ids: &'a Option<PyReadonlyArray2<'_, i64>>,
+    frequencies: &PyReadonlyArray2<'_, f64>,
+) -> PyResult<Option<&'a [i64]>> {
+    match degenerate_ids {
+        None => Ok(None),
+        Some(ids) => {
+            if ids.shape() != frequencies.shape() {
+                return Err(PyValueError::new_err(
+                    "degenerate_ids must have the shape of frequencies",
+                ));
+            }
+            ids.as_slice()
+                .map(Some)
+                .map_err(|_| PyValueError::new_err("degenerate_ids must be C-contiguous"))
+        }
+    }
+}
+
 fn vec3_i(arr: &PyReadonlyArray1<i64>) -> PyResult<[i64; 3]> {
     let v = arr.as_array();
     if v.len() != 3 {
@@ -3055,6 +3076,13 @@ fn py_rayon_max_threads() -> usize {
 
 #[pyfunction]
 #[pyo3(name = "pp_collision")]
+#[pyo3(signature = (
+    collisions, relative_grid_address, frequencies, eigenvectors, triplets,
+    triplet_weights, bz_grid_addresses, bz_map, bz_grid_type, d_diag, q_mat, fc3,
+    fc3_nonzero_indices, svecs, multiplicity, masses, p2s_map, s2p_map,
+    band_indices, temperatures_thz, is_n_u, symmetrize_fc3_q, make_r0_average,
+    all_shortest, cutoff_frequency, is_compact_fc3, degenerate_ids=None,
+))]
 #[allow(clippy::too_many_arguments)]
 fn py_pp_collision<'py>(
     py: Python<'py>,
@@ -3084,7 +3112,9 @@ fn py_pp_collision<'py>(
     all_shortest: PyReadonlyArray3<'py, i8>,
     cutoff_frequency: f64,
     is_compact_fc3: bool,
+    degenerate_ids: Option<PyReadonlyArray2<'py, i64>>,
 ) -> PyResult<()> {
+    let deg_ids = degenerate_ids_slice(&degenerate_ids, &frequencies)?;
     let num_patom = p2s_map.shape()[0];
     let num_satom = s2p_map.shape()[0];
     let num_rows = if is_compact_fc3 { num_patom } else { num_satom };
@@ -3251,6 +3281,7 @@ fn py_pp_collision<'py>(
             cutoff_frequency,
             num_band0,
             num_band,
+            deg_ids,
         )
     })
     .map_err(|e| match e {
@@ -3489,6 +3520,15 @@ fn py_pp_collision_with_sigma<'py>(
 /// - Remaining arrays mirror ``pp_collision`` layouts.
 #[pyfunction]
 #[pyo3(name = "collision_at_grid_point")]
+#[pyo3(signature = (
+    collisions, grid_point, sigmas, sigma_cutoffs, relative_grid_address, bzg2grg,
+    reciprocal_rotations, is_time_reversal, swappable, is_mesh_symmetry,
+    reciprocal_lattice, bz_triplets_q_mat, frequencies, eigenvectors,
+    bz_grid_addresses, bz_map, bz_grid_type, d_diag, q_mat, fc3,
+    fc3_nonzero_indices, svecs, multiplicity, masses, p2s_map, s2p_map,
+    band_indices, temperatures_thz, is_n_u, symmetrize_fc3_q, make_r0_average,
+    all_shortest, cutoff_frequency, is_compact_fc3, degenerate_ids=None,
+))]
 #[allow(clippy::too_many_arguments)]
 fn py_collision_at_grid_point<'py>(
     py: Python<'py>,
@@ -3526,7 +3566,9 @@ fn py_collision_at_grid_point<'py>(
     all_shortest: PyReadonlyArray3<'py, i8>,
     cutoff_frequency: f64,
     is_compact_fc3: bool,
+    degenerate_ids: Option<PyReadonlyArray2<'py, i64>>,
 ) -> PyResult<()> {
+    let deg_ids = degenerate_ids_slice(&degenerate_ids, &frequencies)?;
     let num_patom = p2s_map.shape()[0];
     let num_satom = s2p_map.shape()[0];
     let num_rows = if is_compact_fc3 { num_patom } else { num_satom };
@@ -3789,6 +3831,7 @@ fn py_collision_at_grid_point<'py>(
                     cutoff_frequency,
                     num_band0,
                     num_band,
+                    deg_ids,
                 )?;
             } else {
                 pp_collision::get_pp_collision_with_sigma(
@@ -3844,6 +3887,15 @@ fn py_collision_at_grid_point<'py>(
 /// All other inputs match ``collision_at_grid_point``.
 #[pyfunction]
 #[pyo3(name = "collision_at_grid_points_batched")]
+#[pyo3(signature = (
+    collisions, grid_points, sigmas, sigma_cutoffs, relative_grid_address,
+    bzg2grg, reciprocal_rotations, is_time_reversal, swappable, is_mesh_symmetry,
+    reciprocal_lattice, bz_triplets_q_mat, frequencies, eigenvectors,
+    bz_grid_addresses, bz_map, bz_grid_type, d_diag, q_mat, fc3,
+    fc3_nonzero_indices, svecs, multiplicity, masses, p2s_map, s2p_map,
+    band_indices, temperatures_thz, is_n_u, symmetrize_fc3_q, make_r0_average,
+    all_shortest, cutoff_frequency, is_compact_fc3, degenerate_ids=None,
+))]
 #[allow(clippy::too_many_arguments)]
 fn py_collision_at_grid_points_batched<'py>(
     py: Python<'py>,
@@ -3881,7 +3933,9 @@ fn py_collision_at_grid_points_batched<'py>(
     all_shortest: PyReadonlyArray3<'py, i8>,
     cutoff_frequency: f64,
     is_compact_fc3: bool,
+    degenerate_ids: Option<PyReadonlyArray2<'py, i64>>,
 ) -> PyResult<()> {
+    let deg_ids = degenerate_ids_slice(&degenerate_ids, &frequencies)?;
     let num_patom = p2s_map.shape()[0];
     let num_satom = s2p_map.shape()[0];
     let num_rows = if is_compact_fc3 { num_patom } else { num_satom };
@@ -4164,6 +4218,7 @@ fn py_collision_at_grid_points_batched<'py>(
                     cutoff_frequency,
                     num_band0,
                     num_band,
+                    deg_ids,
                 )?;
             } else {
                 pp_collision::get_pp_collision_with_sigma_multi_gp(
