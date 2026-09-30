@@ -19,7 +19,8 @@ use crate::interaction::{get_interaction_at_triplet, InteractionScratch};
 use crate::real_to_reciprocal::AtomTriplets;
 use crate::triplet::{is_n, set_relative_grid_address};
 use crate::triplet_iw::{
-    integration_weight_per_triplet, integration_weight_with_sigma_per_triplet, TpType,
+    average_weights_over_degenerate_sets, integration_weight_per_triplet,
+    integration_weight_with_sigma_per_triplet, TpType,
 };
 
 /// Scratch buffers reused across triplets to avoid per-triplet heap
@@ -225,10 +226,38 @@ fn finalize(
     }
 }
 
+/// Average the integration weights of `triplet` over its degenerate
+/// bands at q' and q'' when `degenerate_ids` (`(num_grid, num_band)`
+/// flat) is given.
+fn average_weights_if_requested(
+    scratch: &mut CollisionScratch,
+    degenerate_ids: Option<&[i64]>,
+    triplet: [i64; 3],
+    num_band0: usize,
+    num_band: usize,
+) {
+    if let Some(ids) = degenerate_ids {
+        let ids1 = &ids[triplet[1] as usize * num_band..(triplet[1] as usize + 1) * num_band];
+        let ids2 = &ids[triplet[2] as usize * num_band..(triplet[2] as usize + 1) * num_band];
+        average_weights_over_degenerate_sets(
+            &mut scratch.g_buf,
+            &mut scratch.g_zero,
+            ids1,
+            ids2,
+            num_band0,
+            num_band,
+        );
+    }
+}
+
 /// Tetrahedron-method driver, port of `ppc_get_pp_collision`.
 ///
 /// Writes `collisions` with shape `(num_temps, num_band0)` or
 /// `(2, num_temps, num_band0)` when `is_n_u` is true.
+///
+/// When `degenerate_ids` (`(num_grid, num_band)` flat) is given, the
+/// integration weights of each triplet are averaged over the degenerate
+/// bands at q' and q'' before the interaction is evaluated.
 ///
 /// Always parallelizes over triplets with rayon; per-triplet kernels
 /// run their own internal rayon loops, and rayon's work-stealing
@@ -255,6 +284,7 @@ pub fn get_pp_collision(
     cutoff_frequency: f64,
     num_band0: usize,
     num_band: usize,
+    degenerate_ids: Option<&[i64]>,
 ) -> Result<(), BzGridError> {
     let num_triplets = triplets.len();
     let num_temps = temperatures_thz.len();
@@ -290,6 +320,7 @@ pub fn get_pp_collision(
                 TpType::Type2,
             )?;
         }
+        average_weights_if_requested(scratch, degenerate_ids, triplet, num_band0, num_band);
         evaluate_collision_at_triplet(
             ise_slot,
             &mut scratch.fc3_normal_squared,
@@ -469,8 +500,8 @@ fn collect_freqs_at_gp(
 ///   (`(num_temps, num_band0)` or `(2, num_temps, num_band0)` flat).
 /// - `triplets_per_gp[g]` / `triplet_weights_per_gp[g]`: gp `g`'s
 ///   triplets and ir-weights.
-/// - All other arguments are global across the batch and match the
-///   per-gp `get_pp_collision` semantics.
+/// - All other arguments, `degenerate_ids` included, are global across
+///   the batch and match the per-gp `get_pp_collision` semantics.
 #[allow(clippy::too_many_arguments)]
 pub fn get_pp_collision_multi_gp(
     collisions_per_gp: &mut [&mut [f64]],
@@ -493,6 +524,7 @@ pub fn get_pp_collision_multi_gp(
     cutoff_frequency: f64,
     num_band0: usize,
     num_band: usize,
+    degenerate_ids: Option<&[i64]>,
 ) -> Result<(), BzGridError> {
     let num_gps = triplets_per_gp.len();
     assert_eq!(triplet_weights_per_gp.len(), num_gps);
@@ -564,6 +596,7 @@ pub fn get_pp_collision_multi_gp(
                 TpType::Type2,
             )?;
         }
+        average_weights_if_requested(scratch, degenerate_ids, triplet, num_band0, num_band);
         evaluate_collision_at_triplet(
             ise_slot,
             &mut scratch.fc3_normal_squared,
