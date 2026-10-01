@@ -490,10 +490,10 @@ fn gaussian(x: f64, sigma: f64) -> f64 {
     INV_SQRT_2PI / sigma * (-x * x / 2.0 / sigma / sigma).exp()
 }
 
-/// `(first band, number of bands)` of each degenerate set with more than
-/// one band.  `degenerate_ids[b]` is the smallest band index of the set of
+/// `(first band, number of bands)` of each degenerate set, single bands
+/// included.  `degenerate_ids[b]` is the smallest band index of the set of
 /// band `b`, and the bands of a set are consecutive.
-fn degenerate_runs(degenerate_ids: &[i64]) -> Vec<(usize, usize)> {
+fn degenerate_sets(degenerate_ids: &[i64]) -> Vec<(usize, usize)> {
     let num_band = degenerate_ids.len();
     let starts: Vec<usize> = (0..num_band)
         .filter(|&b| degenerate_ids[b] == b as i64)
@@ -502,20 +502,21 @@ fn degenerate_runs(degenerate_ids: &[i64]) -> Vec<(usize, usize)> {
         .iter()
         .zip(starts.iter().skip(1).chain([&num_band]))
         .map(|(&s, &e)| (s, e - s))
-        .filter(|&(_, n)| n > 1)
         .collect()
 }
 
 /// Average the integration weights of one triplet over the degenerate
-/// bands at q' and at q'', in place.
+/// blocks, in place.
 ///
 /// Mirrors `_average_weights_over_degenerate_sets` in phono3py's
 /// `triplets.py`.  `iw` holds the channels one after another, each of
 /// shape `(num_band0, num_band, num_band)` with the band at q' before the
-/// band at q''; `iw_zero` has the shape of one channel.  The weights are
-/// averaged over the sets at q' first and at q'' second.  An element that
-/// has a nonzero weight in any channel after the average is unmarked in
-/// `iw_zero`; marks are never added.
+/// band at q''; `iw_zero` has the shape of one channel.  A degenerate
+/// block is a degenerate set at q' times a degenerate set at q'', one of
+/// them possibly a single band.  All weights of a block are replaced by
+/// their mean.  In `iw_zero`, all elements of a block are unmarked when
+/// any of them is unmarked, so that an element stays marked only when the
+/// whole block has zero weights.  Marks are never added.
 ///
 /// `degenerate_ids1` and `degenerate_ids2` (`num_band` each) give the
 /// smallest band index of the degenerate set of each band at q' and q''.
@@ -527,38 +528,38 @@ pub fn average_weights_over_degenerate_sets(
     num_band0: usize,
     num_band: usize,
 ) {
-    let runs1 = degenerate_runs(degenerate_ids1);
-    let runs2 = degenerate_runs(degenerate_ids2);
-    if runs1.is_empty() && runs2.is_empty() {
+    let sets1 = degenerate_sets(degenerate_ids1);
+    let sets2 = degenerate_sets(degenerate_ids2);
+    // (first band at q', bands at q', first band at q'', bands at q'') of
+    // each block with more than one element.
+    let blocks: Vec<(usize, usize, usize, usize)> = sets1
+        .iter()
+        .flat_map(|&(s1, c1)| sets2.iter().map(move |&(s2, c2)| (s1, c1, s2, c2)))
+        .filter(|&(_, c1, _, c2)| c1 * c2 > 1)
+        .collect();
+    if blocks.is_empty() {
         return;
     }
     let nbb = num_band * num_band;
-    let num_band_prod = num_band0 * nbb;
-    let num_channels = iw.len() / num_band_prod;
-    for block in iw.chunks_mut(nbb) {
-        for &(start, count) in &runs1 {
-            for b2 in 0..num_band {
-                let sum: f64 = (start..start + count)
-                    .map(|b1| block[b1 * num_band + b2])
-                    .sum();
-                let mean = sum / count as f64;
-                for b1 in start..start + count {
-                    block[b1 * num_band + b2] = mean;
-                }
-            }
-        }
-        for &(start, count) in &runs2 {
-            for b1 in 0..num_band {
-                let row = &mut block[b1 * num_band..(b1 + 1) * num_band];
-                let sum: f64 = row[start..start + count].iter().sum();
-                let mean = sum / count as f64;
-                row[start..start + count].fill(mean);
+    for matrix in iw.chunks_mut(nbb) {
+        for &(s1, c1, s2, c2) in &blocks {
+            let sum: f64 = (s1..s1 + c1)
+                .map(|b1| matrix[b1 * num_band + s2..][..c2].iter().sum::<f64>())
+                .sum();
+            let mean = sum / (c1 * c2) as f64;
+            for b1 in s1..s1 + c1 {
+                matrix[b1 * num_band + s2..][..c2].fill(mean);
             }
         }
     }
-    for (k, z) in iw_zero.iter_mut().enumerate() {
-        if *z != 0 && (0..num_channels).any(|c| iw[c * num_band_prod + k] != 0.0) {
-            *z = 0;
+    debug_assert_eq!(iw_zero.len(), num_band0 * nbb);
+    for matrix in iw_zero.chunks_mut(nbb) {
+        for &(s1, c1, s2, c2) in &blocks {
+            if (s1..s1 + c1).any(|b1| matrix[b1 * num_band + s2..][..c2].contains(&0)) {
+                for b1 in s1..s1 + c1 {
+                    matrix[b1 * num_band + s2..][..c2].fill(0);
+                }
+            }
         }
     }
 }
@@ -568,13 +569,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn degenerate_runs_skip_single_bands() {
+    fn degenerate_sets_include_single_bands() {
         assert_eq!(
-            degenerate_runs(&[0, 1, 1, 3, 3, 3, 6]),
-            vec![(1, 2), (3, 3)]
+            degenerate_sets(&[0, 1, 1, 3, 3, 3, 6]),
+            vec![(0, 1), (1, 2), (3, 3), (6, 1)]
         );
-        assert!(degenerate_runs(&[0, 1, 2]).is_empty());
-        assert_eq!(degenerate_runs(&[0, 0, 0]), vec![(0, 3)]);
+        assert_eq!(degenerate_sets(&[0, 1, 2]), vec![(0, 1), (1, 1), (2, 1)]);
+        assert_eq!(degenerate_sets(&[0, 0, 0]), vec![(0, 3)]);
     }
 
     #[test]
@@ -595,6 +596,17 @@ mod tests {
         iw[k] = 0.0;
         iw[num_band_prod + k] = 0.0;
         iw_zero[k] = 1;
+        // For j=1 the whole (1..3, 0..3) block and the non-degenerate
+        // element (3, 3) are zero in both channels and marked.
+        let marked_j1: Vec<usize> = (1..3)
+            .flat_map(|b1| (0..3).map(move |b2| nbb + b1 * num_band + b2))
+            .chain([nbb + 3 * num_band + 3])
+            .collect();
+        for &m in &marked_j1 {
+            iw[m] = 0.0;
+            iw[num_band_prod + m] = 0.0;
+            iw_zero[m] = 1;
+        }
         let orig = iw.clone();
 
         average_weights_over_degenerate_sets(
@@ -623,7 +635,10 @@ mod tests {
             // Band 0 at q' and band 3 at q'' are not degenerate.
             assert_eq!(iw[off + 3 * num_band + 3], orig[off + 3 * num_band + 3]);
         }
-        assert_eq!(iw_zero[k], 0);
+        // Partly marked block: unmarked.  Fully marked block and the
+        // non-degenerate element: still marked.  Nothing else is marked.
+        let marked: Vec<usize> = (0..num_band_prod).filter(|&m| iw_zero[m] != 0).collect();
+        assert_eq!(marked, marked_j1);
     }
 
     #[test]
