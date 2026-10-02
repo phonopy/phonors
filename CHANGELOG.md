@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-02
+
+### Added
+- `pp_collision`, `collision_at_grid_point`, and
+  `collision_at_grid_points_batched` accept a new argument
+  `degenerate_ids`. It is an integer array of the shape of `frequencies`,
+  and for each band it gives the index of the first band of the degenerate
+  set that the band belongs to. When `degenerate_ids` is given, the
+  tetrahedron-method integration weights of each triplet are averaged over
+  the degenerate bands at q' and over those at q''. The tetrahedron method
+  makes the weight of each band from its frequencies at the neighbouring
+  grid points, where the degeneracy is lifted, so bands that are degenerate
+  at q' or q'' have different weights. After the averaging, they have equal
+  weights. A pair of bands at q' and q'' is treated as having zero weight
+  only when every pair in its degenerate block has zero weight. The default `None` leaves the weights unchanged.
+
 ## [0.5.0] - 2026-09-26
 
 ### Changed
@@ -77,7 +93,8 @@ Initial public release.  Provides the Rust kernel set used by
 `abi3-py310` wheels for Linux x86_64 / aarch64, macOS x86_64 /
 arm64, and Windows x86_64.
 
-[Unreleased]: https://github.com/phonopy/phonors/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/phonopy/phonors/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/phonopy/phonors/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/phonopy/phonors/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/phonopy/phonors/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/phonopy/phonors/compare/v0.2.1...v0.3.0
