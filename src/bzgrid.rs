@@ -271,9 +271,55 @@ fn set_bz_address(
     ]
 }
 
+/// Number of GR-grid points handled by one rayon task when filling
+/// the BZ grid.
+const BZ_GRID_BLOCK_SIZE: usize = 1024;
+
+/// Parameters of the search for the BZ images of GR-grid points.
+struct BzSearch {
+    d_diag: Vec3I,
+    ps: Vec3I,
+    q: MatI,
+    q_inv: MatI,
+    rec_lattice: MatD,
+    tolerance: f64,
+}
+
+impl BzSearch {
+    /// Call `f` with the BZ address of each image of GR-grid point
+    /// `gr_index`, in the order of `BZ_SEARCH_SPACE`.
+    fn for_each_image(&self, gr_index: i64, mut f: impl FnMut(Vec3I)) {
+        let gr_adrs = grid_address_from_index(gr_index, self.d_diag);
+        let (min_distance, nint_v, distances) = bz_distances(
+            gr_adrs,
+            self.d_diag,
+            self.ps,
+            &self.q,
+            &self.rec_lattice,
+            self.tolerance,
+        );
+        for j in 0..125 {
+            if distances[j] < min_distance + self.tolerance {
+                f(set_bz_address(j, gr_adrs, self.d_diag, nint_v, &self.q_inv));
+            }
+        }
+    }
+
+    fn num_images(&self, gr_index: i64) -> i64 {
+        let mut count = 0;
+        self.for_each_image(gr_index, |_| count += 1);
+        count
+    }
+}
+
 /// Build BZ grid addresses, map, and GR mapping.
 ///
 /// `bz_grid_type` mirrors the C API: `1` = sparse layout, `2` = dense layout.
+///
+/// The images of each GR-grid point are counted in parallel, the
+/// counts are turned into offsets by a prefix sum, and the images are
+/// then written in parallel at those offsets.  The result does not
+/// depend on the number of threads.
 pub fn bz_grid_addresses(
     d_diag: Vec3I,
     q: MatI,
@@ -286,88 +332,124 @@ pub fn bz_grid_addresses(
         return Err(BzGridAddressesError::BadGridType);
     }
     let q_inv = inverse_unimodular(&q).ok_or(BzGridAddressesError::NotUnimodularQ)?;
-    let tolerance = bz_tolerance(&rec_lattice, d_diag);
+    let search = BzSearch {
+        d_diag,
+        ps,
+        q,
+        q_inv,
+        rec_lattice,
+        tolerance: bz_tolerance(&rec_lattice, d_diag),
+    };
+    if bz_grid_type == 2 {
+        Ok(bz_grid_addresses_dense(&search))
+    } else {
+        Ok(bz_grid_addresses_sparse(&search))
+    }
+}
 
+/// Ranges `start..end` of GR-grid points, each handled by one rayon
+/// task.
+fn bz_grid_blocks(total_num_gp: usize) -> impl Iterator<Item = (usize, usize)> {
+    (0..total_num_gp)
+        .step_by(BZ_GRID_BLOCK_SIZE)
+        .map(move |start| (start, (start + BZ_GRID_BLOCK_SIZE).min(total_num_gp)))
+}
+
+/// Dense layout: addresses appear in order, gp_map holds the starting
+/// BZ index for each GR-grid point (length = total+1).
+fn bz_grid_addresses_dense(search: &BzSearch) -> BzGridAddresses {
+    let d_diag = search.d_diag;
     let total_num_gp = (d_diag[0] * d_diag[1] * d_diag[2]) as usize;
 
-    if bz_grid_type == 2 {
-        // Dense layout: addresses appear in order, gp_map holds the
-        // starting BZ index for each GR-grid point (length = total+1).
-        let mut addresses: Vec<Vec3I> = Vec::with_capacity(total_num_gp * 8);
-        let mut bzg2grg: Vec<i64> = Vec::with_capacity(total_num_gp * 8);
-        let mut bz_map = vec![0i64; total_num_gp + 1];
-
-        for i in 0..total_num_gp {
-            let gr_adrs = grid_address_from_index(i as i64, d_diag);
-            let (min_distance, nint_v, distances) =
-                bz_distances(gr_adrs, d_diag, ps, &q, &rec_lattice, tolerance);
-            for j in 0..125 {
-                if distances[j] < min_distance + tolerance {
-                    let adrs = set_bz_address(j, gr_adrs, d_diag, nint_v, &q_inv);
-                    addresses.push(adrs);
-                    bzg2grg.push(i as i64);
-                }
-            }
-            bz_map[i + 1] = addresses.len() as i64;
-        }
-        addresses.shrink_to_fit();
-        bzg2grg.shrink_to_fit();
-        return Ok(BzGridAddresses {
-            addresses,
-            bz_map,
-            bzg2grg,
-        });
+    let mut bz_map = vec![0i64; total_num_gp + 1];
+    bz_map[1..]
+        .par_iter_mut()
+        .enumerate()
+        .for_each(|(i, c)| *c = search.num_images(i as i64));
+    for i in 0..total_num_gp {
+        bz_map[i + 1] += bz_map[i];
     }
 
-    // Sparse layout (type 1).
-    let bzmesh: Vec3I = [d_diag[0] * 2, d_diag[1] * 2, d_diag[2] * 2];
-    let num_bzmesh = (bzmesh[0] * bzmesh[1] * bzmesh[2]) as usize;
+    let size = bz_map[total_num_gp] as usize;
+    let mut addresses: Vec<Vec3I> = vec![[0; 3]; size];
+    let mut bzg2grg: Vec<i64> = vec![0; size];
 
-    let mut addresses: Vec<Vec3I> = vec![[0; 3]; total_num_gp * 8];
-    let mut bzg2grg: Vec<i64> = vec![0; total_num_gp * 8];
-    let mut bz_map = vec![num_bzmesh as i64; num_bzmesh + total_num_gp + 1];
-    bz_map[num_bzmesh] = 0;
-
-    let mut boundary_num_gp: i64 = 0;
-    let mut id_shift: i64 = 0;
-
-    for i in 0..total_num_gp as i64 {
-        let gr_adrs = grid_address_from_index(i, d_diag);
-        let (min_distance, nint_v, distances) =
-            bz_distances(gr_adrs, d_diag, ps, &q, &rec_lattice, tolerance);
-        let mut count: i64 = 0;
-        for j in 0..125 {
-            if distances[j] < min_distance + tolerance {
-                let gp = if count == 0 {
-                    i
-                } else {
-                    let g = boundary_num_gp + total_num_gp as i64;
-                    boundary_num_gp += 1;
-                    g
-                };
-                count += 1;
-                let adrs = set_bz_address(j, gr_adrs, d_diag, nint_v, &q_inv);
-                addresses[gp as usize] = adrs;
-                // Equivalent to C's grg_get_double_grid_index on the
-                // 2x mesh: `(adrs*2 + ps - ps)/2` collapses to `adrs`,
-                // after which `grid_index_from_address` applies the
-                // Euclidean modulo against `bzmesh`.
-                let bzgp = grid_index_from_address(adrs, bzmesh);
-                bz_map[bzgp as usize] = gp;
-                bzg2grg[gp as usize] = i;
-            }
-        }
-        id_shift += count - 1;
-        bz_map[num_bzmesh + (i as usize) + 1] = id_shift;
+    // Split the outputs into the disjoint ranges of the blocks.
+    let mut tasks = Vec::with_capacity(total_num_gp.div_ceil(BZ_GRID_BLOCK_SIZE));
+    let mut adrs_rest = &mut addresses[..];
+    let mut grg_rest = &mut bzg2grg[..];
+    for (start, end) in bz_grid_blocks(total_num_gp) {
+        let len = (bz_map[end] - bz_map[start]) as usize;
+        let (adrs, rest) = std::mem::take(&mut adrs_rest).split_at_mut(len);
+        adrs_rest = rest;
+        let (grg, rest) = std::mem::take(&mut grg_rest).split_at_mut(len);
+        grg_rest = rest;
+        tasks.push((start, end, adrs, grg));
     }
-    let size = (boundary_num_gp + total_num_gp as i64) as usize;
-    addresses.truncate(size);
-    bzg2grg.truncate(size);
-    Ok(BzGridAddresses {
+
+    tasks.into_par_iter().for_each(|(start, end, adrs, grg)| {
+        let mut k = 0;
+        for i in start..end {
+            search.for_each_image(i as i64, |a| {
+                adrs[k] = a;
+                grg[k] = i as i64;
+                k += 1;
+            });
+        }
+    });
+    BzGridAddresses {
         addresses,
         bz_map,
         bzg2grg,
-    })
+    }
+}
+
+/// Sparse layout, converted from the dense layout: the first image of
+/// GR-grid point `i` is stored at `i`, and the other images are
+/// appended after the `total_num_gp` first images in the order of the
+/// grid points.
+fn bz_grid_addresses_sparse(search: &BzSearch) -> BzGridAddresses {
+    let dense = bz_grid_addresses_dense(search);
+    let d_diag = search.d_diag;
+    let total_num_gp = (d_diag[0] * d_diag[1] * d_diag[2]) as usize;
+    let bzmesh: Vec3I = [d_diag[0] * 2, d_diag[1] * 2, d_diag[2] * 2];
+    let num_bzmesh = (bzmesh[0] * bzmesh[1] * bzmesh[2]) as usize;
+    let images = |i: usize| dense.bz_map[i] as usize..dense.bz_map[i + 1] as usize;
+
+    let mut addresses = Vec::with_capacity(dense.addresses.len());
+    let mut bzg2grg = Vec::with_capacity(dense.addresses.len());
+    for i in 0..total_num_gp {
+        addresses.push(dense.addresses[images(i).start]);
+        bzg2grg.push(i as i64);
+    }
+    for i in 0..total_num_gp {
+        for j in images(i).skip(1) {
+            addresses.push(dense.addresses[j]);
+            bzg2grg.push(i as i64);
+        }
+    }
+
+    // bz_map[bzgp] is the index of the image at `bzgp` on the 2x mesh.
+    // Equivalent to C's grg_get_double_grid_index on the 2x mesh:
+    // `(adrs*2 + ps - ps)/2` collapses to `adrs`, after which
+    // `grid_index_from_address` applies the Euclidean modulo against
+    // `bzmesh`.  Images of different GR-grid points never share `bzgp`,
+    // and the images of one point are visited in the serial order, so
+    // the last one wins on a collision as in the serial code.
+    let mut bz_map = vec![num_bzmesh as i64; num_bzmesh + total_num_gp + 1];
+    for (gp, &a) in addresses.iter().enumerate() {
+        bz_map[grid_index_from_address(a, bzmesh) as usize] = gp as i64;
+    }
+    // bz_map[num_bzmesh + i] is the number of extra images of the grid
+    // points before `i`.
+    for i in 0..=total_num_gp {
+        bz_map[num_bzmesh + i] = dense.bz_map[i] - i as i64;
+    }
+    BzGridAddresses {
+        addresses,
+        bz_map,
+        bzg2grg,
+    }
 }
 
 /// Rotate a BZ-grid point and return the rotated point's BZ index.
