@@ -1,9 +1,10 @@
 use numpy::ndarray::{Array1, Array2, Array3};
 use numpy::{
-    Complex64, IntoPyArray, PyArray1, PyArray2, PyArray3, PyReadonlyArray1, PyReadonlyArray2,
-    PyReadonlyArray3, PyReadonlyArray4, PyReadonlyArray5, PyReadonlyArray6, PyReadonlyArrayDyn,
-    PyReadwriteArray1, PyReadwriteArray2, PyReadwriteArray3, PyReadwriteArray4, PyReadwriteArray5,
-    PyReadwriteArray6, PyReadwriteArrayDyn, PyUntypedArrayMethods,
+    Complex64, IntoPyArray, PyArray1, PyArray2, PyArray3, PyArray4, PyArrayMethods,
+    PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArray3, PyReadonlyArray4, PyReadonlyArray5,
+    PyReadonlyArray6, PyReadonlyArrayDyn, PyReadwriteArray1, PyReadwriteArray2, PyReadwriteArray3,
+    PyReadwriteArray4, PyReadwriteArray5, PyReadwriteArray6, PyReadwriteArrayDyn,
+    PyUntypedArrayMethods,
 };
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -20,6 +21,7 @@ mod dynmat;
 mod fc2;
 mod fc3;
 mod fc4;
+mod fourier_bins;
 mod funcs;
 mod grgrid;
 mod imag_self_energy;
@@ -335,6 +337,167 @@ fn py_bz_grid_addresses<'py>(
             "bz_grid_addresses: reciprocal lattice is singular",
         )),
     }
+}
+
+/// Sum the Fourier coefficients of a supercell by q and K mod N^p.
+///
+/// ``coefficients`` is a list of complex128 arrays of the shape
+/// ``(N^s_3, N^s_2, N^s_1)`` of the supercell FFT mesh.  The rows of the
+/// series are the box ``-ceil(N^s_k / 2) + 1 <= g_k <= floor(N^s_k / 2)``
+/// with the coefficient ``c.ravel()[j]`` of row ``j``, or, when ``g``
+/// ``(n, 3)`` is given, the rows of ``g`` with the coefficient
+/// ``c.ravel()[source[j]] * weight[j]``.  For ``g' = g @ rotation`` and
+/// ``h = g' @ inv(p2s_matrix)`` split into the integer part ``K`` and the
+/// fractional part ``q``, the coefficient times
+/// ``exp(-2 pi i g' . translation)`` is added to ``F[i_q, Kbar_3, Kbar_2,
+/// Kbar_1]`` with ``Kbar = K mod fft_mesh``.  With the Smith normal form
+/// ``U_1 @ p2s_matrix @ U_2 = diag(d)`` of ``snf3x3``, ``i_q`` is the C-order
+/// index of ``(g' @ U_2) mod d`` over ``d``.  Each bin is summed in the
+/// order of the rows, as ``np.bincount``, for any number of threads.
+///
+/// Returns a list of complex128 arrays of the shape
+/// ``(N_c, fft_mesh[2], fft_mesh[1], fft_mesh[0])`` with
+/// ``N_c = |det(p2s_matrix)|``.  Raises ``ValueError`` for inconsistent
+/// shapes, a singular ``p2s_matrix``, a non-positive mesh, or ``source``
+/// out of range.
+#[pyfunction]
+#[pyo3(
+    name = "bin_supercell_fourier_coefficients",
+    signature = (
+        coefficients,
+        p2s_matrix,
+        fft_mesh,
+        rotation=None,
+        translation=None,
+        g=None,
+        source=None,
+        weight=None,
+    )
+)]
+fn py_bin_supercell_fourier_coefficients<'py>(
+    py: Python<'py>,
+    coefficients: Vec<PyReadonlyArray3<'py, Complex64>>,
+    p2s_matrix: PyReadonlyArray2<'py, i64>,
+    fft_mesh: PyReadonlyArray1<'py, i64>,
+    rotation: Option<PyReadonlyArray2<'py, i64>>,
+    translation: Option<PyReadonlyArray1<'py, f64>>,
+    g: Option<PyReadonlyArray2<'py, i64>>,
+    source: Option<PyReadonlyArray1<'py, i64>>,
+    weight: Option<PyReadonlyArray1<'py, f64>>,
+) -> PyResult<Vec<Bound<'py, PyArray4<Complex64>>>> {
+    let shape = match coefficients.first() {
+        Some(c) => c.shape().to_vec(),
+        None => return Err(PyValueError::new_err("coefficients must not be empty")),
+    };
+    if coefficients.iter().any(|c| c.shape() != shape.as_slice()) {
+        return Err(PyValueError::new_err(
+            "coefficients must have the same shape",
+        ));
+    }
+    let mesh = [shape[2] as i64, shape[1] as i64, shape[0] as i64];
+    let p2s = mat3_i(&p2s_matrix)?;
+    let pm = vec3_i(&fft_mesh)?;
+    let rot = match &rotation {
+        Some(r) => mat3_i(r)?,
+        None => crate::common::IDENTITY,
+    };
+    let trans = match &translation {
+        Some(t) => {
+            let v = t.as_array();
+            if v.len() != 3 {
+                return Err(PyValueError::new_err("translation must have shape (3,)"));
+            }
+            Some([v[0], v[1], v[2]])
+        }
+        None => None,
+    };
+    let reps = match (&g, &source, &weight) {
+        (None, None, None) => None,
+        (Some(g), Some(source), Some(weight)) => {
+            if g.shape().len() != 2 || g.shape()[1] != 3 {
+                return Err(PyValueError::new_err("g must have shape (n, 3)"));
+            }
+            let g = g
+                .as_slice()
+                .map_err(|_| PyValueError::new_err("g must be C-contiguous"))?;
+            let source = source
+                .as_slice()
+                .map_err(|_| PyValueError::new_err("source must be C-contiguous"))?;
+            let weight = weight
+                .as_slice()
+                .map_err(|_| PyValueError::new_err("weight must be C-contiguous"))?;
+            Some(fourier_bins::Representatives {
+                g: group_as_array::<i64, 3>(g),
+                source,
+                weight,
+            })
+        }
+        _ => {
+            return Err(PyValueError::new_err(
+                "g, source, and weight must be given together",
+            ))
+        }
+    };
+    let cs = coefficients
+        .iter()
+        .map(|c| {
+            c.as_slice()
+                .map(complex_as_cmplx)
+                .map_err(|_| PyValueError::new_err("coefficients must be C-contiguous"))
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+
+    let err = |e: fourier_bins::BinSupercellFourierCoefficientsError| {
+        use fourier_bins::BinSupercellFourierCoefficientsError as E;
+        PyValueError::new_err(match e {
+            E::SingularP2sMatrix => {
+                "bin_supercell_fourier_coefficients: p2s_matrix is singular"
+            }
+            E::SnfNotConverged => {
+                "bin_supercell_fourier_coefficients: Smith normal form did not converge"
+            }
+            E::NonPositiveMesh => {
+                "bin_supercell_fourier_coefficients: mesh numbers must be positive"
+            }
+            E::TooLarge => {
+                "bin_supercell_fourier_coefficients: number of rows or bins exceeds 2^32"
+            }
+            E::LengthMismatch => {
+                "bin_supercell_fourier_coefficients: g, source, and weight must have the same length"
+            }
+            E::SourceOutOfRange => {
+                "bin_supercell_fourier_coefficients: source is out of range"
+            }
+        })
+    };
+    let num_cells = fourier_bins::num_bins(p2s, [1, 1, 1]).map_err(err)?;
+    fourier_bins::num_bins(p2s, pm).map_err(err)?;
+    let outs: Vec<Bound<'py, PyArray4<Complex64>>> = (0..cs.len())
+        .map(|_| {
+            PyArray4::zeros(
+                py,
+                [num_cells, pm[2] as usize, pm[1] as usize, pm[0] as usize],
+                false,
+            )
+        })
+        .collect();
+    let mut rws: Vec<_> = outs.iter().map(|a| a.readwrite()).collect();
+    let mut fs = rws
+        .iter_mut()
+        .map(|rw| {
+            rw.as_slice_mut()
+                .map(complex_as_cmplx_mut)
+                .map_err(|_| PyRuntimeError::new_err("output is not contiguous"))
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+    py.detach(|| {
+        fourier_bins::bin_supercell_fourier_coefficients(
+            &mut fs, &cs, mesh, p2s, pm, rot, trans, reps,
+        )
+    })
+    .map_err(err)?;
+    drop(rws);
+    Ok(outs)
 }
 
 /// Rotate a BZ grid index and return the rotated point's BZ index.
@@ -6508,6 +6671,7 @@ fn phonors(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_reciprocal_rotations, m)?)?;
     m.add_function(wrap_pyfunction!(py_transform_rotations, m)?)?;
     m.add_function(wrap_pyfunction!(py_bz_grid_addresses, m)?)?;
+    m.add_function(wrap_pyfunction!(py_bin_supercell_fourier_coefficients, m)?)?;
     m.add_function(wrap_pyfunction!(py_rotate_bz_grid_index, m)?)?;
     m.add_function(wrap_pyfunction!(py_ir_triplets_at_q, m)?)?;
     m.add_function(wrap_pyfunction!(py_bz_triplets_at_q, m)?)?;
