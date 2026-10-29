@@ -331,6 +331,9 @@ fn py_bz_grid_addresses<'py>(
         Err(BzGridAddressesError::BadGridType) => Err(PyValueError::new_err(
             "bz_grid_addresses: bz_grid_type must be 1 or 2",
         )),
+        Err(BzGridAddressesError::SingularReciprocalLattice) => Err(PyValueError::new_err(
+            "bz_grid_addresses: reciprocal lattice is singular",
+        )),
     }
 }
 

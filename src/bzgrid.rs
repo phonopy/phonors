@@ -4,141 +4,10 @@
 
 use rayon::prelude::*;
 
-use crate::common::{matvec_dd, matvec_id, matvec_ii, nint, MatD, MatI, Vec3I};
+use crate::common::{det_d, matvec_dd, matvec_id, matvec_ii, nint, MatD, MatI, Vec3D, Vec3I};
 use crate::grgrid::{double_grid_address, grid_address_from_index, grid_index_from_address};
 
 const GRID_TOLERANCE_FACTOR: f64 = 0.01;
-
-/// 125-point search space used to locate BZ-equivalent images of
-/// each GR-grid point.  Copied verbatim from `bz_search_space` in
-/// `c/bzgrid.c`.
-const BZ_SEARCH_SPACE: [Vec3I; 125] = [
-    [0, 0, 0],
-    [0, 0, 1],
-    [0, 0, 2],
-    [0, 0, -2],
-    [0, 0, -1],
-    [0, 1, 0],
-    [0, 1, 1],
-    [0, 1, 2],
-    [0, 1, -2],
-    [0, 1, -1],
-    [0, 2, 0],
-    [0, 2, 1],
-    [0, 2, 2],
-    [0, 2, -2],
-    [0, 2, -1],
-    [0, -2, 0],
-    [0, -2, 1],
-    [0, -2, 2],
-    [0, -2, -2],
-    [0, -2, -1],
-    [0, -1, 0],
-    [0, -1, 1],
-    [0, -1, 2],
-    [0, -1, -2],
-    [0, -1, -1],
-    [1, 0, 0],
-    [1, 0, 1],
-    [1, 0, 2],
-    [1, 0, -2],
-    [1, 0, -1],
-    [1, 1, 0],
-    [1, 1, 1],
-    [1, 1, 2],
-    [1, 1, -2],
-    [1, 1, -1],
-    [1, 2, 0],
-    [1, 2, 1],
-    [1, 2, 2],
-    [1, 2, -2],
-    [1, 2, -1],
-    [1, -2, 0],
-    [1, -2, 1],
-    [1, -2, 2],
-    [1, -2, -2],
-    [1, -2, -1],
-    [1, -1, 0],
-    [1, -1, 1],
-    [1, -1, 2],
-    [1, -1, -2],
-    [1, -1, -1],
-    [2, 0, 0],
-    [2, 0, 1],
-    [2, 0, 2],
-    [2, 0, -2],
-    [2, 0, -1],
-    [2, 1, 0],
-    [2, 1, 1],
-    [2, 1, 2],
-    [2, 1, -2],
-    [2, 1, -1],
-    [2, 2, 0],
-    [2, 2, 1],
-    [2, 2, 2],
-    [2, 2, -2],
-    [2, 2, -1],
-    [2, -2, 0],
-    [2, -2, 1],
-    [2, -2, 2],
-    [2, -2, -2],
-    [2, -2, -1],
-    [2, -1, 0],
-    [2, -1, 1],
-    [2, -1, 2],
-    [2, -1, -2],
-    [2, -1, -1],
-    [-2, 0, 0],
-    [-2, 0, 1],
-    [-2, 0, 2],
-    [-2, 0, -2],
-    [-2, 0, -1],
-    [-2, 1, 0],
-    [-2, 1, 1],
-    [-2, 1, 2],
-    [-2, 1, -2],
-    [-2, 1, -1],
-    [-2, 2, 0],
-    [-2, 2, 1],
-    [-2, 2, 2],
-    [-2, 2, -2],
-    [-2, 2, -1],
-    [-2, -2, 0],
-    [-2, -2, 1],
-    [-2, -2, 2],
-    [-2, -2, -2],
-    [-2, -2, -1],
-    [-2, -1, 0],
-    [-2, -1, 1],
-    [-2, -1, 2],
-    [-2, -1, -2],
-    [-2, -1, -1],
-    [-1, 0, 0],
-    [-1, 0, 1],
-    [-1, 0, 2],
-    [-1, 0, -2],
-    [-1, 0, -1],
-    [-1, 1, 0],
-    [-1, 1, 1],
-    [-1, 1, 2],
-    [-1, 1, -2],
-    [-1, 1, -1],
-    [-1, 2, 0],
-    [-1, 2, 1],
-    [-1, 2, 2],
-    [-1, 2, -2],
-    [-1, 2, -1],
-    [-1, -2, 0],
-    [-1, -2, 1],
-    [-1, -2, 2],
-    [-1, -2, -2],
-    [-1, -2, -1],
-    [-1, -1, 0],
-    [-1, -1, 1],
-    [-1, -1, 2],
-    [-1, -1, -2],
-    [-1, -1, -1],
-];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BzGridAddressesError {
@@ -146,6 +15,8 @@ pub enum BzGridAddressesError {
     NotUnimodularQ,
     /// Unsupported `bz_grid_type` (must be 1 or 2).
     BadGridType,
+    /// The reciprocal basis vectors are linearly dependent.
+    SingularReciprocalLattice,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -207,62 +78,87 @@ pub(crate) fn bz_tolerance(rec_lattice: &MatD, d_diag: Vec3I) -> f64 {
     max_len * GRID_TOLERANCE_FACTOR
 }
 
-/// Compute distances to 125 candidate BZ-equivalent points and
-/// identify the minimum.  Returns `(min_distance, nint, distances)`
-/// matching the C helper `get_bz_distances`.
-fn bz_distances(
-    grid_address: Vec3I,
-    d_diag: Vec3I,
-    ps: Vec3I,
-    q: &MatI,
-    rec_lattice: &MatD,
-    tolerance: f64,
-) -> (f64, Vec3I, [f64; 125]) {
-    let dadrs = double_grid_address(grid_address, ps);
-    let mut q_red = [
-        dadrs[0] as f64 / (2.0 * d_diag[0] as f64),
-        dadrs[1] as f64 / (2.0 * d_diag[1] as f64),
-        dadrs[2] as f64 / (2.0 * d_diag[2] as f64),
-    ];
-    q_red = matvec_id(q, q_red);
-    let mut nint_v = [0i64; 3];
-    for i in 0..3 {
-        nint_v[i] = nint(q_red[i]);
-        q_red[i] -= nint_v[i] as f64;
-    }
+/// Margin against rounding added to the range of each coefficient
+/// `m_i` of the search.
+const BZ_SEARCH_MARGIN: f64 = 1e-8;
 
-    let mut distances = [0.0f64; 125];
-    for (i, g) in BZ_SEARCH_SPACE.iter().enumerate() {
-        let v = [
-            q_red[0] + g[0] as f64,
-            q_red[1] + g[1] as f64,
-            q_red[2] + g[2] as f64,
-        ];
-        let vc = matvec_dd(rec_lattice, v);
-        distances[i] = vc[0] * vc[0] + vc[1] * vc[1] + vc[2] * vc[2];
-    }
+/// Bound of `|m_i|` of the candidates that the search visits first.
+/// `bz_search_space` in `c/bzgrid.c` searches only the 125 candidates
+/// with `|m_i| <= 2`.
+const BZ_SEARCH_FIRST: i64 = 2;
 
-    let mut min_distance = distances[0];
-    for i in 1..125 {
-        if distances[i] < min_distance - tolerance {
-            min_distance = distances[i];
+/// Integers from `lo` to `hi` in the order of the frequencies of an
+/// FFT: the non-negative ones in increasing order, and then the negative
+/// ones in increasing order, e.g., 0, 1, 2, -2, -1.
+fn fft_order(lo: i64, hi: i64) -> impl Iterator<Item = i64> + Clone {
+    (lo.max(0)..=hi).chain(lo..=hi.min(-1))
+}
+
+/// Call `f` with each candidate `m` with `lo[i] <= m_i <= hi[i]`.
+///
+/// The candidates with all `|m_i| <= BZ_SEARCH_FIRST` come first, in
+/// lexicographic order of `(m_0, m_1, m_2)` with each `m_i` in the order
+/// of `fft_order`.  This is the order of `bz_search_space` in
+/// `c/bzgrid.c`, so the order of the images is that of the C code
+/// whenever they are all among these candidates.  The candidates with
+/// some `|m_i| > BZ_SEARCH_FIRST` follow, in lexicographic order of
+/// `(m_0, m_1, m_2)` with each `m_i` in increasing order.
+fn for_each_candidate(lo: Vec3I, hi: Vec3I, mut f: impl FnMut(Vec3I)) {
+    let first_lo = lo.map(|x| x.max(-BZ_SEARCH_FIRST));
+    let first_hi = hi.map(|x| x.min(BZ_SEARCH_FIRST));
+    for m0 in fft_order(first_lo[0], first_hi[0]) {
+        for m1 in fft_order(first_lo[1], first_hi[1]) {
+            for m2 in fft_order(first_lo[2], first_hi[2]) {
+                f([m0, m1, m2]);
+            }
         }
     }
-    (min_distance, nint_v, distances)
+    if lo == first_lo && hi == first_hi {
+        return;
+    }
+    for m0 in lo[0]..=hi[0] {
+        for m1 in lo[1]..=hi[1] {
+            for m2 in lo[2]..=hi[2] {
+                let m = [m0, m1, m2];
+                if m.iter().any(|x| x.abs() > BZ_SEARCH_FIRST) {
+                    f(m);
+                }
+            }
+        }
+    }
+}
+
+/// Lengths of the dual vectors of the columns of `rec_lattice`, i.e.,
+/// of the rows of its inverse.  `None` if `rec_lattice` is singular.
+fn dual_lengths(rec_lattice: &MatD) -> Option<Vec3D> {
+    let col = |j: usize| [rec_lattice[0][j], rec_lattice[1][j], rec_lattice[2][j]];
+    let cross = |a: Vec3D, b: Vec3D| {
+        [
+            a[1] * b[2] - a[2] * b[1],
+            a[2] * b[0] - a[0] * b[2],
+            a[0] * b[1] - a[1] * b[0],
+        ]
+    };
+    let norm = |a: Vec3D| (a[0] * a[0] + a[1] * a[1] + a[2] * a[2]).sqrt();
+    let det = det_d(rec_lattice);
+    if det == 0.0 || !det.is_finite() {
+        return None;
+    }
+    Some([
+        norm(cross(col(1), col(2))) / det.abs(),
+        norm(cross(col(2), col(0))) / det.abs(),
+        norm(cross(col(0), col(1))) / det.abs(),
+    ])
 }
 
 fn set_bz_address(
-    bz_index: usize,
+    m: Vec3I,
     grid_address: Vec3I,
     d_diag: Vec3I,
     nint_v: Vec3I,
     q_inv: &MatI,
 ) -> Vec3I {
-    let delta_g = [
-        BZ_SEARCH_SPACE[bz_index][0] - nint_v[0],
-        BZ_SEARCH_SPACE[bz_index][1] - nint_v[1],
-        BZ_SEARCH_SPACE[bz_index][2] - nint_v[2],
-    ];
+    let delta_g = [m[0] - nint_v[0], m[1] - nint_v[1], m[2] - nint_v[2]];
     let delta_g = matvec_ii(q_inv, delta_g);
     [
         grid_address[0] + delta_g[0] * d_diag[0],
@@ -283,26 +179,86 @@ struct BzSearch {
     q_inv: MatI,
     rec_lattice: MatD,
     tolerance: f64,
+    /// Lengths of the dual vectors of the columns of `rec_lattice`.
+    dual_lengths: Vec3D,
 }
 
 impl BzSearch {
+    /// Split the reduced coordinates `q_red` of GR-grid point
+    /// `grid_address` in the basis `rec_lattice` into
+    /// `q_red = s0 + nint_v` with `|s0_i| <= 1/2` and an integer vector
+    /// `nint_v`.  Returns `(s0, nint_v)`.
+    fn split_reduced_coordinates(&self, grid_address: Vec3I) -> (Vec3D, Vec3I) {
+        let d_diag = self.d_diag;
+        let dadrs = double_grid_address(grid_address, self.ps);
+        let mut q_red = [
+            dadrs[0] as f64 / (2.0 * d_diag[0] as f64),
+            dadrs[1] as f64 / (2.0 * d_diag[1] as f64),
+            dadrs[2] as f64 / (2.0 * d_diag[2] as f64),
+        ];
+        q_red = matvec_id(&self.q, q_red);
+        let mut nint_v = [0i64; 3];
+        for i in 0..3 {
+            nint_v[i] = nint(q_red[i]);
+            q_red[i] -= nint_v[i] as f64;
+        }
+        (q_red, nint_v)
+    }
+
+    /// Squared length of `rec_lattice (s0 + m)`.
+    fn distance(&self, s0: Vec3D, m: Vec3I) -> f64 {
+        let v = [
+            s0[0] + m[0] as f64,
+            s0[1] + m[1] as f64,
+            s0[2] + m[2] as f64,
+        ];
+        let vc = matvec_dd(&self.rec_lattice, v);
+        vc[0] * vc[0] + vc[1] * vc[1] + vc[2] * vc[2]
+    }
+
+    /// Range `lo[i] <= m_i <= hi[i]` that contains every candidate that
+    /// can lower the minimum or be kept in `for_each_image`.
+    ///
+    /// The minimum starts at `|y0|^2` with `y0 = rec_lattice s0` and only
+    /// decreases, so such a candidate `x = rec_lattice (s0 + m)` has
+    /// `|x|^2 < |y0|^2 + tolerance = R^2`.  With the dual vectors `w*_i`
+    /// (rows of `rec_lattice^-1`), `s0_i + m_i = w*_i . x`, so
+    /// `|s0_i + m_i| <= R |w*_i|`.  This holds for any basis; a reduced
+    /// basis only makes the range smaller.
+    fn search_range(&self, s0: Vec3D) -> (Vec3I, Vec3I) {
+        let r = (self.distance(s0, [0, 0, 0]) + self.tolerance).sqrt();
+        let mut lo = [0i64; 3];
+        let mut hi = [0i64; 3];
+        for i in 0..3 {
+            let half_width = r * self.dual_lengths[i] + BZ_SEARCH_MARGIN;
+            lo[i] = (-s0[i] - half_width).ceil() as i64;
+            hi[i] = (-s0[i] + half_width).floor() as i64;
+        }
+        (lo, hi)
+    }
+
     /// Call `f` with the BZ address of each image of GR-grid point
-    /// `gr_index`, in the order of `BZ_SEARCH_SPACE`.
+    /// `gr_index`, in the order of `for_each_candidate`.
+    ///
+    /// The minimum is lowered only by a candidate shorter than it by more
+    /// than `tolerance`, so that the first of nearly equal candidates
+    /// sets it, and the candidates within `tolerance` of it are kept.
     fn for_each_image(&self, gr_index: i64, mut f: impl FnMut(Vec3I)) {
         let gr_adrs = grid_address_from_index(gr_index, self.d_diag);
-        let (min_distance, nint_v, distances) = bz_distances(
-            gr_adrs,
-            self.d_diag,
-            self.ps,
-            &self.q,
-            &self.rec_lattice,
-            self.tolerance,
-        );
-        for j in 0..125 {
-            if distances[j] < min_distance + self.tolerance {
-                f(set_bz_address(j, gr_adrs, self.d_diag, nint_v, &self.q_inv));
+        let (s0, nint_v) = self.split_reduced_coordinates(gr_adrs);
+        let (lo, hi) = self.search_range(s0);
+        let mut min_distance = self.distance(s0, [0, 0, 0]);
+        for_each_candidate(lo, hi, |m| {
+            let distance = self.distance(s0, m);
+            if distance < min_distance - self.tolerance {
+                min_distance = distance;
             }
-        }
+        });
+        for_each_candidate(lo, hi, |m| {
+            if self.distance(s0, m) < min_distance + self.tolerance {
+                f(set_bz_address(m, gr_adrs, self.d_diag, nint_v, &self.q_inv));
+            }
+        });
     }
 
     fn num_images(&self, gr_index: i64) -> i64 {
@@ -320,6 +276,14 @@ impl BzSearch {
 /// counts are turned into offsets by a prefix sum, and the images are
 /// then written in parallel at those offsets.  The result does not
 /// depend on the number of threads.
+///
+/// The search finds all images for any basis `rec_lattice`, but the
+/// tolerance of the ties, `bz_tolerance`, is computed from the lengths
+/// of its columns.  Pass a reduced basis, such as the Niggli-reduced
+/// basis that phonopy passes, whose longest column is as short as
+/// possible.  With a strongly skewed basis, the tolerance can be larger
+/// than the difference between the squared lengths of two images, and
+/// then images that are not the shortest are also kept.
 pub fn bz_grid_addresses(
     d_diag: Vec3I,
     q: MatI,
@@ -332,6 +296,8 @@ pub fn bz_grid_addresses(
         return Err(BzGridAddressesError::BadGridType);
     }
     let q_inv = inverse_unimodular(&q).ok_or(BzGridAddressesError::NotUnimodularQ)?;
+    let dual_lengths =
+        dual_lengths(&rec_lattice).ok_or(BzGridAddressesError::SingularReciprocalLattice)?;
     let search = BzSearch {
         d_diag,
         ps,
@@ -339,6 +305,7 @@ pub fn bz_grid_addresses(
         q_inv,
         rec_lattice,
         tolerance: bz_tolerance(&rec_lattice, d_diag),
+        dual_lengths,
     };
     if bz_grid_type == 2 {
         Ok(bz_grid_addresses_dense(&search))
@@ -611,4 +578,299 @@ fn fill_neighboring_grid_points_type2(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::{matmul_d, transpose_i};
+
+    const IDENTITY: MatI = [[1, 0, 0], [0, 1, 0], [0, 0, 1]];
+    const ZERO: Vec3I = [0, 0, 0];
+
+    /// Unimodular U that skews a basis B into B U.  Some images need
+    /// |m_i| > 2 in the basis B U, so the 125 candidates of the C code are
+    /// not enough.  The tolerance computed from B U stays below a quarter
+    /// of the differences of the squared lengths for the lattices and
+    /// meshes of the tests.  A stronger skew makes the tolerance, which
+    /// grows with the lengths of the basis vectors, larger than these
+    /// differences, and then the images depend on the basis.
+    fn skew() -> MatI {
+        [[1, 3, 0], [0, 1, 2], [0, 0, 1]]
+    }
+
+    /// Rotation by `angle` about the unit vector along `axis`.
+    fn rotation(axis: Vec3D, angle: f64) -> MatD {
+        let n = (axis[0] * axis[0] + axis[1] * axis[1] + axis[2] * axis[2]).sqrt();
+        let [x, y, z] = [axis[0] / n, axis[1] / n, axis[2] / n];
+        let (s, c) = angle.sin_cos();
+        let t = 1.0 - c;
+        [
+            [t * x * x + c, t * x * y - s * z, t * x * z + s * y],
+            [t * x * y + s * z, t * y * y + c, t * y * z - s * x],
+            [t * x * z - s * y, t * y * z + s * x, t * z * z + c],
+        ]
+    }
+
+    fn scaled(m: &MatD, factor: f64) -> MatD {
+        m.map(|row| row.map(|x| x * factor))
+    }
+
+    fn cubic() -> MatD {
+        scaled(&mat_i_to_d(&IDENTITY), 1.0 / 10.7)
+    }
+
+    /// Reciprocal basis (columns) of the hexagonal lattice with a = 3
+    /// and c = 4.8.
+    fn hexagonal() -> MatD {
+        let r = 1.0 / (3.0 * 3.0f64.sqrt());
+        [
+            [1.0 / 3.0, 0.0, 0.0],
+            [r, 2.0 * r, 0.0],
+            [0.0, 0.0, 1.0 / 4.8],
+        ]
+    }
+
+    /// Reciprocal basis (columns) of the FCC lattice with a = 4.05.
+    fn fcc() -> MatD {
+        scaled(
+            &[[-1.0, 1.0, 1.0], [1.0, -1.0, 1.0], [1.0, 1.0, -1.0]],
+            1.0 / 4.05,
+        )
+    }
+
+    fn mat_i_to_d(m: &MatI) -> MatD {
+        m.map(|row| row.map(|x| x as f64))
+    }
+
+    fn dense(d_diag: Vec3I, q: MatI, rec_lattice: MatD) -> BzGridAddresses {
+        bz_grid_addresses(d_diag, q, ZERO, rec_lattice, 2).unwrap()
+    }
+
+    fn images(bzg: &BzGridAddresses, gp: usize) -> &[Vec3I] {
+        &bzg.addresses[bzg.bz_map[gp] as usize..bzg.bz_map[gp + 1] as usize]
+    }
+
+    fn num_gp(d_diag: Vec3I) -> usize {
+        (d_diag[0] * d_diag[1] * d_diag[2]) as usize
+    }
+
+    /// Cartesian coordinates of the point at `address` with PS = 0.
+    fn cartesian(rec_lattice: &MatD, q: &MatI, d_diag: Vec3I, address: Vec3I) -> Vec3D {
+        let s = [
+            address[0] as f64 / d_diag[0] as f64,
+            address[1] as f64 / d_diag[1] as f64,
+            address[2] as f64 / d_diag[2] as f64,
+        ];
+        matvec_dd(rec_lattice, matvec_id(q, s))
+    }
+
+    /// With the obtuse superbase of the path type w_1 = (-1, 1, 0),
+    /// w_2 = (1, 0, -1), w_3 = (0, 0, 1) of the cubic lattice, the point
+    /// (w_1 + w_3) / 2 is the center of a cube and its eight images
+    /// (+-1/2, +-1/2, +-1/2) are ties.  One of them needs the coefficient
+    /// 2 of w_3.  The basis is rotated so that the ties are equal only up
+    /// to rounding.
+    #[test]
+    fn path_superbase_ties() {
+        let path: MatI = [[-1, 1, 0], [1, 0, -1], [0, 0, 1]];
+        let path = transpose_i(&path);
+        let rec = matmul_d(
+            &rotation([1.0, 2.0, 3.0], 0.7),
+            &scaled(&mat_i_to_d(&path), 0.37),
+        );
+        let d_diag = [4, 4, 4];
+        let bzg = dense(d_diag, IDENTITY, rec);
+        let gp = grid_index_from_address([2, 0, 2], d_diag) as usize;
+        // In the cubic lattice, 4 x = path a, and x = (+-1/2, +-1/2, +-1/2).
+        let mut corners: Vec<Vec3I> = images(&bzg, gp)
+            .iter()
+            .map(|&a| matvec_ii(&path, a))
+            .collect();
+        corners.sort();
+        let mut expected: Vec<Vec3I> = Vec::new();
+        for x in [-2, 2] {
+            for y in [-2, 2] {
+                for z in [-2, 2] {
+                    expected.push([x, y, z]);
+                }
+            }
+        }
+        assert_eq!(corners, expected);
+    }
+
+    /// The images are the same when the basis is replaced by a skewed one,
+    /// rec_lattice U with Q = U^-1, which describes the same grid.
+    #[test]
+    fn images_do_not_depend_on_basis() {
+        let u = skew();
+        let u_inv = inverse_unimodular(&u).unwrap();
+        for (rec, d_diag) in [
+            (cubic(), [6, 6, 6]),
+            (hexagonal(), [6, 6, 4]),
+            (fcc(), [5, 6, 4]),
+        ] {
+            let bzg = dense(d_diag, IDENTITY, rec);
+            let bzg_skewed = dense(d_diag, u_inv, matmul_d(&rec, &mat_i_to_d(&u)));
+            let mut num_ties = 0;
+            for gp in 0..num_gp(d_diag) {
+                let mut expected = images(&bzg, gp).to_vec();
+                let mut found = images(&bzg_skewed, gp).to_vec();
+                expected.sort();
+                found.sort();
+                assert_eq!(found, expected, "grid point {gp}");
+                num_ties += (expected.len() > 1) as usize;
+            }
+            assert!(num_ties > 0);
+        }
+    }
+
+    /// The images for a skewed basis equal those of a search over all
+    /// |m_i| <= 8.
+    #[test]
+    fn images_equal_brute_force_for_skewed_basis() {
+        const M: i64 = 8;
+        let u = skew();
+        let rec = matmul_d(&cubic(), &mat_i_to_d(&u));
+        let d_diag = [4, 5, 6];
+        let tolerance = bz_tolerance(&rec, d_diag);
+        let bzg = dense(d_diag, IDENTITY, rec);
+        let mut max_m = 0;
+        for gp in 0..num_gp(d_diag) {
+            let address = grid_address_from_index(gp as i64, d_diag);
+            let s: Vec3D = [0, 1, 2].map(|i| address[i] as f64 / d_diag[i] as f64);
+            let mut candidates = Vec::new();
+            for m0 in -M..=M {
+                for m1 in -M..=M {
+                    for m2 in -M..=M {
+                        let x =
+                            matvec_dd(&rec, [s[0] + m0 as f64, s[1] + m1 as f64, s[2] + m2 as f64]);
+                        candidates.push(([m0, m1, m2], x, x[0] * x[0] + x[1] * x[1] + x[2] * x[2]));
+                    }
+                }
+            }
+            let min = candidates.iter().map(|c| c.2).fold(f64::INFINITY, f64::min);
+            let expected: Vec<_> = candidates
+                .iter()
+                .filter(|c| c.2 < min + tolerance)
+                .collect();
+            for c in &expected {
+                max_m = max_m.max(c.0.iter().map(|x| x.abs()).max().unwrap());
+            }
+            let found = images(&bzg, gp);
+            assert_eq!(found.len(), expected.len(), "grid point {gp}");
+            for &a in found {
+                let x = cartesian(&rec, &IDENTITY, d_diag, a);
+                assert!(
+                    expected
+                        .iter()
+                        .any(|c| (0..3).all(|i| (c.1[i] - x[i]).abs() < 1e-9)),
+                    "grid point {gp}"
+                );
+            }
+        }
+        // The images are inside the searched box, and some are outside
+        // |m_i| <= 2.
+        assert!(max_m < M);
+        assert!(max_m > 2);
+    }
+
+    /// The candidates with all |m_i| <= 2 are visited in the order of
+    /// `bz_search_space` in `c/bzgrid.c`.  The expected entries are taken
+    /// from that array at the given positions.
+    #[test]
+    fn first_candidates_follow_c_order() {
+        let mut visited = Vec::new();
+        for_each_candidate([-2, -2, -2], [2, 2, 2], |m| visited.push(m));
+        assert_eq!(visited.len(), 125);
+        for (i, m) in [
+            (0, [0, 0, 0]),
+            (1, [0, 0, 1]),
+            (2, [0, 0, 2]),
+            (3, [0, 0, -2]),
+            (4, [0, 0, -1]),
+            (5, [0, 1, 0]),
+            (6, [0, 1, 1]),
+            (24, [0, -1, -1]),
+            (25, [1, 0, 0]),
+            (49, [1, -1, -1]),
+            (50, [2, 0, 0]),
+            (62, [2, 2, 2]),
+            (63, [2, 2, -2]),
+            (75, [-2, 0, 0]),
+            (100, [-1, 0, 0]),
+            (124, [-1, -1, -1]),
+        ] {
+            assert_eq!(visited[i], m, "position {i}");
+        }
+        // With a larger range, the same 125 come first, and the others
+        // follow.
+        let mut visited_large = Vec::new();
+        for_each_candidate([-3, -2, -4], [2, 3, 2], |m| visited_large.push(m));
+        assert_eq!(visited_large.len(), 6 * 6 * 7);
+        assert_eq!(visited_large[..125], visited[..]);
+        assert!(visited_large[125..]
+            .iter()
+            .all(|m| m.iter().any(|x| x.abs() > 2)));
+    }
+
+    /// The images and their order agree with the C code for bases where
+    /// its 125 candidates are enough.
+    #[test]
+    fn order_of_images_is_kept() {
+        let cases: [(MatD, Vec3I, Vec<(Vec3I, Vec<Vec3I>)>); 2] = [
+            (
+                fcc(),
+                [4, 4, 4],
+                vec![
+                    ([2, 0, 0], vec![[-2, 0, 0], [2, 0, 0]]),
+                    (
+                        [3, 2, 1],
+                        vec![[-1, -2, 1], [-1, -2, -3], [-1, 2, 1], [3, 2, 1]],
+                    ),
+                ],
+            ),
+            (
+                hexagonal(),
+                [6, 6, 4],
+                vec![
+                    ([3, 0, 0], vec![[-3, 0, 0], [3, 0, 0]]),
+                    ([2, 2, 0], vec![[2, 2, 0], [2, -4, 0], [-4, 2, 0]]),
+                    (
+                        [3, 0, 2],
+                        vec![[-3, 0, -2], [-3, 0, 2], [3, 0, -2], [3, 0, 2]],
+                    ),
+                    (
+                        [2, 2, 2],
+                        vec![
+                            [2, 2, -2],
+                            [2, 2, 2],
+                            [2, -4, -2],
+                            [2, -4, 2],
+                            [-4, 2, -2],
+                            [-4, 2, 2],
+                        ],
+                    ),
+                ],
+            ),
+        ];
+        for (rec, d_diag, expected) in cases {
+            let bzg = dense(d_diag, IDENTITY, rec);
+            let sparse = bz_grid_addresses(d_diag, IDENTITY, ZERO, rec, 1).unwrap();
+            for (address, images_expected) in expected {
+                let gp = grid_index_from_address(address, d_diag) as usize;
+                assert_eq!(images(&bzg, gp), &images_expected[..]);
+                assert_eq!(sparse.addresses[gp], images_expected[0]);
+            }
+        }
+    }
+
+    #[test]
+    fn singular_reciprocal_lattice_is_an_error() {
+        let rec = [[1.0, 2.0, 0.0], [0.0, 0.0, 1.0], [0.0, 0.0, 0.0]];
+        assert_eq!(
+            bz_grid_addresses([2, 2, 2], IDENTITY, ZERO, rec, 2).err(),
+            Some(BzGridAddressesError::SingularReciprocalLattice)
+        );
+    }
 }
