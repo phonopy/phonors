@@ -2,28 +2,37 @@
 //!
 //! Kernel of the native evaluation of a Fourier series of the supercell on
 //! the grid of the primitive cell in phelel (`FourierSeriesOnGrid.get_phi`).
-//! For the integer coordinates g of the reciprocal lattice vectors of the
-//! supercell (row vectors), the rotated g' = g R is written in the
-//! reciprocal basis of the primitive cell as
+//! The series has the coefficients c(g) at the integer coordinates g of the
+//! reciprocal lattice vectors of the supercell (column vectors).  For a
+//! space-group operation acting as x^s -> W^s x^s + w^s in the fractional
+//! coordinates of the supercell,
+//!
+//! ```text
+//! sum_g c(g) exp(2 pi i g . (W^s)^-1 (x^s - w^s))
+//!     = sum_g c(g) exp(-2 pi i g' . w^s) exp(2 pi i g' . x^s),
+//! g' = (W^s)^-T g.
+//! ```
+//!
+//! g' is written in the reciprocal basis of the primitive cell as
 //!
 //! ```text
 //! h = (M^s)^-T g' = K + q,
 //! ```
 //!
 //! with the supercell matrix M^s, the integer part K and the fractional part
-//! q.  With N_c = |det M^s| and B = N_c (M^s)^-1, an integer matrix,
-//! N_c h = (g' B)^T and K = floor((g' B) / N_c).  With the Smith normal form
-//! U_1 M^s U_2 = diag(d), q is labeled by n' = (g' U_2) mod d, and
-//! i_q = (n'_1 d_2 + n'_2) d_3 + n'_3 (C order over d).  With
+//! q.  With N_c = |det M^s|, N_c (M^s)^-T is an integer matrix, so N_c h is
+//! an integer vector and K = floor(N_c h / N_c).  With the Smith normal form
+//! P M^s Q = diag(d), q is labeled by n_q = Q^T g' mod d, and
+//! i_q = ((n_q)_1 d_2 + (n_q)_2) d_3 + (n_q)_3 (C order over d).  With
 //! Kbar = K mod N^p, the bin of g is
 //!
 //! ```text
-//! index = ((i_q N^p_3 + Kbar_3) N^p_2 + Kbar_2) N^p_1 + Kbar_1,
+//! i_F = ((i_q N^p_3 + Kbar_3) N^p_2 + Kbar_2) N^p_1 + Kbar_1,
 //! ```
 //!
-//! and the coefficient times exp(-2 pi i g' . w) is added to F[index].
+//! and c(g) exp(-2 pi i g' . w^s) is added to F[i_F].
 //!
-//! The sums are deterministic: the rows are sorted by (index, row) and each
+//! The sums are deterministic: the rows are sorted by (i_F, row) and each
 //! bin is summed in the order of the rows, as `np.bincount` does, for any
 //! number of threads.
 
@@ -36,6 +45,8 @@ use crate::snf3x3::snf3x3;
 pub enum BinSupercellFourierCoefficientsError {
     /// The supercell matrix is singular.
     SingularP2sMatrix,
+    /// The determinant of the rotation is not +1 or -1.
+    NonUnimodularRotation,
     /// The Smith normal form of the supercell matrix did not converge.
     SnfNotConverged,
     /// A component of the supercell FFT mesh or of fft_mesh is not positive.
@@ -55,14 +66,14 @@ pub struct Representatives<'a> {
     pub weight: &'a [f64],
 }
 
-/// Integer matrices that map g' to its bin.
+/// Integer matrices that map g to g' and g' to its bin.
 struct Binning {
-    /// R^T, so that g' = R^T g (g' = g R for row vectors).
-    rotation_t: MatI,
-    /// B^T with B = N_c (M^s)^-1.
-    b_t: MatI,
-    /// U_2^T.
-    u2_t: MatI,
+    /// (W^s)^-T.
+    w_inv_t: MatI,
+    /// N_c (M^s)^-T.
+    nc_m_inv_t: MatI,
+    /// Q^T.
+    q_t: MatI,
     num_cells: i64,
     snf_diag: Vec3I,
     fft_mesh: Vec3I,
@@ -81,15 +92,20 @@ impl Binning {
         if fft_mesh.iter().any(|&n| n <= 0) {
             return Err(BinSupercellFourierCoefficientsError::NonPositiveMesh);
         }
+        let det_w = det_i(&rotation);
+        if det_w.abs() != 1 {
+            return Err(BinSupercellFourierCoefficientsError::NonUnimodularRotation);
+        }
         let snf = snf3x3(p2s_matrix)
             .map_err(|_| BinSupercellFourierCoefficientsError::SnfNotConverged)?;
+        // (W^s)^-1 = adj(W^s) / det(W^s) = det(W^s) adj(W^s).
+        let w_inv = adjugate(&rotation).map(|row| row.map(|x| x * det_w));
         // N_c (M^s)^-1 = N_c adj(M^s) / det(M^s) = sign(det M^s) adj(M^s).
-        let adj = adjugate(&p2s_matrix);
-        let b = adj.map(|row| row.map(|x| x * det.signum()));
+        let nc_m_inv = adjugate(&p2s_matrix).map(|row| row.map(|x| x * det.signum()));
         Ok(Self {
-            rotation_t: transpose_i(&rotation),
-            b_t: transpose_i(&b),
-            u2_t: transpose_i(&snf.q),
+            w_inv_t: transpose_i(&w_inv),
+            nc_m_inv_t: transpose_i(&nc_m_inv),
+            q_t: transpose_i(&snf.q),
             num_cells: det.abs(),
             snf_diag: snf.d_diag,
             fft_mesh,
@@ -100,17 +116,18 @@ impl Binning {
         self.num_cells * self.fft_mesh[0] * self.fft_mesh[1] * self.fft_mesh[2]
     }
 
+    /// g' = (W^s)^-T g.
     fn rotate(&self, g: Vec3I) -> Vec3I {
-        matvec_ii(&self.rotation_t, g)
+        matvec_ii(&self.w_inv_t, g)
     }
 
-    /// Bin of the rotated g'.
-    fn index(&self, gp: Vec3I) -> u64 {
-        let nh = matvec_ii(&self.b_t, gp);
-        let n_prime = matvec_ii(&self.u2_t, gp);
+    /// Flat index i_F of the bin of g'.
+    fn i_f(&self, gp: Vec3I) -> u64 {
+        let nh = matvec_ii(&self.nc_m_inv_t, gp);
+        let n_q = matvec_ii(&self.q_t, gp);
         let d = self.snf_diag;
-        let i_q = (n_prime[0].rem_euclid(d[0]) * d[1] + n_prime[1].rem_euclid(d[1])) * d[2]
-            + n_prime[2].rem_euclid(d[2]);
+        let i_q = (n_q[0].rem_euclid(d[0]) * d[1] + n_q[1].rem_euclid(d[1])) * d[2]
+            + n_q[2].rem_euclid(d[2]);
         let [n1, n2, n3] = self.fft_mesh;
         let kbar = |k: usize| {
             nh[k]
@@ -204,9 +221,10 @@ pub fn num_bins(
 ///
 /// `coefficients[c]` has the length N^s_1 N^s_2 N^s_3 of the supercell FFT
 /// mesh `mesh` (flattened with g_1 fastest) and `fs[c]` the length
-/// `num_bins`; every element of `fs[c]` is written.  `rotation` is R with
-/// g' = g R.  The phase exp(-2 pi i g' . w) is applied when `translation`
-/// is w.  With `representatives` None, the rows are the box of `mesh`.
+/// `num_bins`; every element of `fs[c]` is written.  `rotation` is W^s of
+/// the operation, and the rows g are binned by g' = (W^s)^-T g.  The phase
+/// exp(-2 pi i g' . w^s) is applied when `translation` is w^s.  With
+/// `representatives` None, the rows are the box of `mesh`.
 pub fn bin_supercell_fourier_coefficients(
     fs: &mut [&mut [Cmplx]],
     coefficients: &[&[Cmplx]],
@@ -254,7 +272,7 @@ pub fn bin_supercell_fourier_coefficients(
     // not depend on the number of threads.
     let mut keys: Vec<u64> = (0..num_rows)
         .into_par_iter()
-        .map(|j| (binning.index(binning.rotate(rows.g(j))) << 32) | j as u64)
+        .map(|j| (binning.i_f(binning.rotate(rows.g(j))) << 32) | j as u64)
         .collect();
     keys.par_sort_unstable();
 
@@ -321,7 +339,7 @@ mod tests {
 
     /// diag(2, 4, 6) multiplied by unimodular matrices from both sides.  Its
     /// Smith normal form has two diagonal elements larger than one, so that
-    /// C and Fortran orders of n' differ.
+    /// C and Fortran orders of n_q differ.
     fn p2s_skewed() -> MatI {
         [[6, 4, 0], [4, 4, 0], [0, 6, 6]]
     }
@@ -392,7 +410,7 @@ mod tests {
                 let (s, cs) = arg.sin_cos();
                 v = cmplx_mul(v, [cs, s]);
             }
-            let i = binning.index(gp) as usize;
+            let i = binning.i_f(gp) as usize;
             f[i][0] += v[0];
             f[i][1] += v[1];
         }
@@ -445,8 +463,24 @@ mod tests {
         );
     }
 
-    /// N_c h = g' B splits into N_c K + N_c q, where q = U_1^T diag(d)^-1 n'
-    /// mod 1 with n' unraveled from i_q in C order, and Kbar = K mod N^p.
+    /// g' = (W^s)^-T g, checked by (W^s)^T g' = g without the inverse.
+    #[test]
+    fn rotate_applies_inverse_transpose() {
+        // Six-fold rotation of a hexagonal lattice, which is not orthogonal,
+        // and the same times the inversion, with determinant -1.
+        let six_fold = [[1, -1, 0], [1, 0, 0], [0, 0, 1]];
+        let rotoinversion = six_fold.map(|row| row.map(|x| -x));
+        for w in [three_fold(), six_fold, rotoinversion] {
+            let binning = Binning::new(IDENTITY, [1, 1, 1], w).unwrap();
+            for g in box_g([5, 4, 3]) {
+                assert_eq!(matvec_ii(&transpose_i(&w), binning.rotate(g)), g);
+            }
+        }
+    }
+
+    /// N_c h = N_c (M^s)^-T g' splits into N_c K + N_c q, where
+    /// q = P^T diag(d)^-1 n_q mod 1 with n_q unraveled from i_q in C order,
+    /// and Kbar = K mod N^p.
     #[test]
     fn index_splits_h_into_k_and_q() {
         let fft_mesh = [3, 4, 5];
@@ -456,26 +490,27 @@ mod tests {
             assert!(d.iter().filter(|&&x| x > 1).count() >= 2);
             let binning = Binning::new(p2s, fft_mesh, three_fold()).unwrap();
             let nc = binning.num_cells;
-            // (M^s)^-1 B = N_c I checks B independently of the adjugate.
-            let b = transpose_i(&binning.b_t);
+            // M^s N_c (M^s)^-1 = N_c I checks N_c (M^s)^-1 independently of
+            // the adjugate.
+            let nc_m_inv = transpose_i(&binning.nc_m_inv_t);
             assert_eq!(
-                crate::common::matmul_i(&p2s, &b),
+                crate::common::matmul_i(&p2s, &nc_m_inv),
                 [[nc, 0, 0], [0, nc, 0], [0, 0, nc]]
             );
             for g in box_g([7, 6, 5]) {
                 let gp = binning.rotate(g);
-                let mut i = binning.index(gp) as i64;
+                let mut i = binning.i_f(gp) as i64;
                 let kbar1 = i % fft_mesh[0];
                 i /= fft_mesh[0];
                 let kbar2 = i % fft_mesh[1];
                 i /= fft_mesh[1];
                 let kbar3 = i % fft_mesh[2];
                 let i_q = i / fft_mesh[2];
-                let n_prime = [i_q / (d[1] * d[2]), (i_q / d[2]) % d[1], i_q % d[2]];
-                // N_c q in row vectors: (n' * (N_c / d)) U_1 mod N_c.
-                let scaled = [0, 1, 2].map(|k| n_prime[k] * (nc / d[k]));
+                let n_q = [i_q / (d[1] * d[2]), (i_q / d[2]) % d[1], i_q % d[2]];
+                // N_c q in row vectors: (n_q * (N_c / d)) P mod N_c.
+                let scaled = [0, 1, 2].map(|k| n_q[k] * (nc / d[k]));
                 let nq = matvec_ii(&transpose_i(&snf.p), scaled).map(|x| x.rem_euclid(nc));
-                let nh = matvec_ii(&transpose_i(&b), gp);
+                let nh = matvec_ii(&binning.nc_m_inv_t, gp);
                 for k in 0..3 {
                     assert_eq!(nh[k].rem_euclid(nc), nq[k]);
                     let kk = (nh[k] - nq[k]) / nc;
@@ -612,6 +647,20 @@ mod tests {
         assert_eq!(
             call([2, 2, 2], IDENTITY, [1, 0, 1], 0, None),
             Err(E::NonPositiveMesh)
+        );
+        let mut f = vec![[0.0; 2]; 1];
+        assert_eq!(
+            bin_supercell_fourier_coefficients(
+                &mut [&mut f],
+                &[&c],
+                [2, 2, 2],
+                IDENTITY,
+                [1, 1, 1],
+                [[2, 0, 0], [0, 1, 0], [0, 0, 1]],
+                None,
+                None,
+            ),
+            Err(E::NonUnimodularRotation)
         );
         assert_eq!(
             call([2, -2, 2], IDENTITY, [1, 1, 1], 1, None),
