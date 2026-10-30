@@ -346,20 +346,23 @@ fn py_bz_grid_addresses<'py>(
 /// series are the box ``-ceil(N^s_k / 2) + 1 <= g_k <= floor(N^s_k / 2)``
 /// with the coefficient ``c.ravel()[j]`` of row ``j``, or, when ``g``
 /// ``(n, 3)`` is given, the rows of ``g`` with the coefficient
-/// ``c.ravel()[source[j]] * weight[j]``.  For ``g' = g @ rotation`` and
+/// ``c.ravel()[source[j]] * weight[j]``.  ``rotation`` and ``translation``
+/// are those of a space-group operation acting as
+/// ``x -> rotation @ x + translation`` in the fractional coordinates of the
+/// supercell.  For ``g' = g @ inv(rotation)`` and
 /// ``h = g' @ inv(p2s_matrix)`` split into the integer part ``K`` and the
 /// fractional part ``q``, the coefficient times
 /// ``exp(-2 pi i g' . translation)`` is added to ``F[i_q, Kbar_3, Kbar_2,
 /// Kbar_1]`` with ``Kbar = K mod fft_mesh``.  With the Smith normal form
-/// ``U_1 @ p2s_matrix @ U_2 = diag(d)`` of ``snf3x3``, ``i_q`` is the C-order
-/// index of ``(g' @ U_2) mod d`` over ``d``.  Each bin is summed in the
+/// ``P @ p2s_matrix @ Q = diag(d)`` of ``snf3x3``, ``i_q`` is the C-order
+/// index of ``(g' @ Q) mod d`` over ``d``.  Each bin is summed in the
 /// order of the rows, as ``np.bincount``, for any number of threads.
 ///
 /// Returns a list of complex128 arrays of the shape
 /// ``(N_c, fft_mesh[2], fft_mesh[1], fft_mesh[0])`` with
 /// ``N_c = |det(p2s_matrix)|``.  Raises ``ValueError`` for inconsistent
-/// shapes, a singular ``p2s_matrix``, a non-positive mesh, or ``source``
-/// out of range.
+/// shapes, a singular ``p2s_matrix``, ``rotation`` with determinant other
+/// than +1 or -1, a non-positive mesh, or ``source`` out of range.
 #[pyfunction]
 #[pyo3(
     name = "bin_supercell_fourier_coefficients",
@@ -452,6 +455,9 @@ fn py_bin_supercell_fourier_coefficients<'py>(
         PyValueError::new_err(match e {
             E::SingularP2sMatrix => {
                 "bin_supercell_fourier_coefficients: p2s_matrix is singular"
+            }
+            E::NonUnimodularRotation => {
+                "bin_supercell_fourier_coefficients: determinant of rotation must be +1 or -1"
             }
             E::SnfNotConverged => {
                 "bin_supercell_fourier_coefficients: Smith normal form did not converge"
