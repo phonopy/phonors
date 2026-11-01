@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-11-01
+
+### Added
+- `bin_supercell_fourier_coefficients`, which bins the Fourier coefficients
+  of a supercell by q-point for the Fourier series evaluation of phelel.
+
+### Changed
+- `bz_grid_addresses` is parallelized. The output is bit identical to the
+  previous version and does not depend on the number of threads.
+- The search of the BZ images of a grid point is bounded per grid point
+  instead of using 125 fixed candidates, so the images are found
+  correctly also for a reciprocal basis that is not reduced, unless it is
+  so distorted. The search is expected to be faster, because only a few
+  candidates are checked for most grid points.
+
 ## [0.6.0] - 2026-10-02
 
 ### Added
@@ -93,7 +108,8 @@ Initial public release.  Provides the Rust kernel set used by
 `abi3-py310` wheels for Linux x86_64 / aarch64, macOS x86_64 /
 arm64, and Windows x86_64.
 
-[Unreleased]: https://github.com/phonopy/phonors/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/phonopy/phonors/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/phonopy/phonors/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/phonopy/phonors/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/phonopy/phonors/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/phonopy/phonors/compare/v0.3.0...v0.4.0
