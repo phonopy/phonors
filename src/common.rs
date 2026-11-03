@@ -35,6 +35,12 @@ pub fn cmplx_add(a: Cmplx, b: Cmplx) -> Cmplx {
     [a[0] + b[0], a[1] + b[1]]
 }
 
+/// Complex negation.
+#[inline(always)]
+pub fn cmplx_neg(a: Cmplx) -> Cmplx {
+    [-a[0], -a[1]]
+}
+
 pub const IDENTITY: MatI = [[1, 0, 0], [0, 1, 0], [0, 0, 1]];
 pub const INVERSION: MatI = [[-1, 0, 0], [0, -1, 0], [0, 0, -1]];
 

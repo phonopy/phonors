@@ -591,6 +591,47 @@ fn py_rotate_spin_components<'py>(
     Ok(())
 }
 
+/// Apply time reversal to the spin components, in place.
+///
+/// ``values`` is a list of one, two or four C-contiguous complex128 arrays
+/// of the same shape: the spin components [11, 12, 21, 22] of VASP become
+/// [conj(v_3), -conj(v_2), -conj(v_1), conj(v_0)], the two collinear ones
+/// [conj(v_1), conj(v_0)], and one is conjugated.  The pure-Python
+/// counterpart is
+/// ``phelel.base.potential_change._apply_time_reversal_to_spin_components_python``.
+/// Raises ``ValueError`` for another number of components, different
+/// shapes, or non-contiguous arrays.
+#[pyfunction]
+#[pyo3(name = "apply_time_reversal_to_spin_components")]
+fn py_apply_time_reversal_to_spin_components<'py>(
+    py: Python<'py>,
+    mut values: Vec<PyReadwriteArrayDyn<'py, Complex64>>,
+) -> PyResult<()> {
+    if ![1, 2, 4].contains(&values.len()) {
+        return Err(PyValueError::new_err(
+            "apply_time_reversal_to_spin_components: values must have one, two or four spin components",
+        ));
+    }
+    let shape = values[0].shape().to_vec();
+    if values.iter().any(|v| v.shape() != shape.as_slice()) {
+        return Err(PyValueError::new_err(
+            "apply_time_reversal_to_spin_components: spin components must have the same shape",
+        ));
+    }
+    let mut slices = values
+        .iter_mut()
+        .map(|v| {
+            v.as_slice_mut().map(complex_as_cmplx_mut).map_err(|_| {
+                PyValueError::new_err(
+                    "apply_time_reversal_to_spin_components: spin components must be C-contiguous",
+                )
+            })
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+    py.detach(|| potential_change::apply_time_reversal_to_spin_components(&mut slices));
+    Ok(())
+}
+
 /// Rotate a BZ grid index and return the rotated point's BZ index.
 ///
 /// ``bz_grid_type`` is 1 for the sparse layout or 2 for the dense layout.
@@ -6765,6 +6806,10 @@ fn phonors(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_bin_supercell_fourier_coefficients, m)?)?;
     m.add_function(wrap_pyfunction!(py_multiply_by_phase, m)?)?;
     m.add_function(wrap_pyfunction!(py_rotate_spin_components, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        py_apply_time_reversal_to_spin_components,
+        m
+    )?)?;
     m.add_function(wrap_pyfunction!(py_rotate_bz_grid_index, m)?)?;
     m.add_function(wrap_pyfunction!(py_ir_triplets_at_q, m)?)?;
     m.add_function(wrap_pyfunction!(py_bz_triplets_at_q, m)?)?;

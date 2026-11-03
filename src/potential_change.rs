@@ -17,7 +17,7 @@
 
 use rayon::prelude::*;
 
-use crate::common::{cmplx_add, cmplx_conj, cmplx_mul, Cmplx, CMPLX_ZERO};
+use crate::common::{cmplx_add, cmplx_conj, cmplx_mul, cmplx_neg, Cmplx, CMPLX_ZERO};
 
 /// Number of elements given to one rayon task.
 const CHUNK_SIZE: usize = 4096;
@@ -118,6 +118,70 @@ pub fn rotate_spin_components(values: &mut [&mut [Cmplx]], spin_rotation: &[[Cmp
                 chunk_3[i] = rotated[3];
             }
         });
+}
+
+/// Apply time reversal to the spin components, element by element.
+///
+/// Time reversal is i sigma_y K, under which the 2x2 matrix
+/// V = [[v_0, v_1], [v_2, v_3]] of four spin components becomes
+/// sigma_y V^* sigma_y:
+///
+/// ```text
+/// [v_0, v_1, v_2, v_3] -> [conj(v_3), -conj(v_2), -conj(v_1), conj(v_0)]
+/// ```
+///
+/// For two components (collinear, up and down), the two are exchanged and
+/// conjugated, [v_0, v_1] -> [conj(v_1), conj(v_0)], and for one component
+/// it is only conjugated.
+///
+/// Python counterpart: `_apply_time_reversal_to_spin_components_python`.
+///
+/// # Panics
+///
+/// If `values` does not have one, two or four slices of the same length.
+pub fn apply_time_reversal_to_spin_components(values: &mut [&mut [Cmplx]]) {
+    match values {
+        [v_0, v_1, v_2, v_3] => {
+            let len = v_0.len();
+            assert!(
+                v_1.len() == len && v_2.len() == len && v_3.len() == len,
+                "spin components differ in length"
+            );
+            v_0.par_chunks_mut(CHUNK_SIZE)
+                .zip(v_1.par_chunks_mut(CHUNK_SIZE))
+                .zip(v_2.par_chunks_mut(CHUNK_SIZE))
+                .zip(v_3.par_chunks_mut(CHUNK_SIZE))
+                .for_each(|(((chunk_0, chunk_1), chunk_2), chunk_3)| {
+                    for i in 0..chunk_0.len() {
+                        let original = [chunk_0[i], chunk_1[i], chunk_2[i], chunk_3[i]];
+                        chunk_0[i] = cmplx_conj(original[3]);
+                        chunk_1[i] = cmplx_neg(cmplx_conj(original[2]));
+                        chunk_2[i] = cmplx_neg(cmplx_conj(original[1]));
+                        chunk_3[i] = cmplx_conj(original[0]);
+                    }
+                });
+        }
+        [v_0, v_1] => {
+            assert!(v_1.len() == v_0.len(), "spin components differ in length");
+            v_0.par_chunks_mut(CHUNK_SIZE)
+                .zip(v_1.par_chunks_mut(CHUNK_SIZE))
+                .for_each(|(chunk_0, chunk_1)| {
+                    for i in 0..chunk_0.len() {
+                        let original = [chunk_0[i], chunk_1[i]];
+                        chunk_0[i] = cmplx_conj(original[1]);
+                        chunk_1[i] = cmplx_conj(original[0]);
+                    }
+                });
+        }
+        [v_0] => {
+            v_0.par_chunks_mut(CHUNK_SIZE).for_each(|chunk_0| {
+                for value in chunk_0.iter_mut() {
+                    *value = cmplx_conj(*value);
+                }
+            });
+        }
+        _ => panic!("values must have one, two or four spin components"),
+    }
 }
 
 #[cfg(test)]
@@ -224,5 +288,49 @@ mod tests {
         let mut slices: Vec<&mut [Cmplx]> = vec![&mut first, &mut second];
         let identity = [[[1.0, 0.0], [0.0, 0.0]], [[0.0, 0.0], [1.0, 0.0]]];
         rotate_spin_components(&mut slices, &identity);
+    }
+
+    /// Apply time reversal to copies of `originals` and return them.
+    fn time_reversed(originals: &[Vec<Cmplx>]) -> Vec<Vec<Cmplx>> {
+        let mut reversed = originals.to_vec();
+        let mut slices: Vec<&mut [Cmplx]> = reversed.iter_mut().map(|v| v.as_mut_slice()).collect();
+        apply_time_reversal_to_spin_components(&mut slices);
+        reversed
+    }
+
+    /// The formulas of the doc comment, for one, two and four components.
+    /// The length is not a multiple of CHUNK_SIZE.
+    #[test]
+    fn apply_time_reversal_to_spin_components_agrees_with_formulas() {
+        let len = CHUNK_SIZE + 3;
+        let originals: Vec<Vec<Cmplx>> = (0..4).map(|k| random_values(len, k + 20)).collect();
+        let conj = |k: usize, i: usize| [originals[k][i][0], -originals[k][i][1]];
+        let minus_conj = |k: usize, i: usize| [-originals[k][i][0], originals[k][i][1]];
+
+        let reversed = time_reversed(&originals);
+        for i in 0..len {
+            assert_eq!(reversed[0][i], conj(3, i));
+            assert_eq!(reversed[1][i], minus_conj(2, i));
+            assert_eq!(reversed[2][i], minus_conj(1, i));
+            assert_eq!(reversed[3][i], conj(0, i));
+        }
+
+        let reversed = time_reversed(&originals[..2]);
+        for i in 0..len {
+            assert_eq!(reversed[0][i], conj(1, i));
+            assert_eq!(reversed[1][i], conj(0, i));
+        }
+
+        let reversed = time_reversed(&originals[..1]);
+        for i in 0..len {
+            assert_eq!(reversed[0][i], conj(0, i));
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "values must have one, two or four spin components")]
+    fn apply_time_reversal_to_spin_components_rejects_three_components() {
+        let originals: Vec<Vec<Cmplx>> = (0..3).map(|k| random_values(4, k)).collect();
+        time_reversed(&originals);
     }
 }
