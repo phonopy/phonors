@@ -27,6 +27,7 @@ mod grgrid;
 mod imag_self_energy;
 mod interaction;
 mod isotope;
+mod potential_change;
 mod pp_collision;
 mod real_self_energy;
 mod real_to_reciprocal;
@@ -504,6 +505,252 @@ fn py_bin_supercell_fourier_coefficients<'py>(
     .map_err(err)?;
     drop(rws);
     Ok(outs)
+}
+
+/// Multiply ``phi`` by ``phase`` element by element, in place.
+///
+/// ``phi`` and ``phase`` are C-contiguous complex128 arrays of the same
+/// shape.  This is a step of ``FourierSeriesOnGrid.get_phi`` in phelel,
+/// whose pure-Python counterpart is
+/// ``phelel.base.potential_change._multiply_by_phase_python``.  Raises
+/// ``ValueError`` for different shapes or non-contiguous arrays.
+#[pyfunction]
+#[pyo3(name = "multiply_by_phase")]
+fn py_multiply_by_phase<'py>(
+    py: Python<'py>,
+    mut phi: PyReadwriteArrayDyn<'py, Complex64>,
+    phase: PyReadonlyArrayDyn<'py, Complex64>,
+) -> PyResult<()> {
+    if phi.shape() != phase.shape() {
+        return Err(PyValueError::new_err(
+            "multiply_by_phase: phi and phase must have the same shape",
+        ));
+    }
+    let phi = phi
+        .as_slice_mut()
+        .map_err(|_| PyValueError::new_err("multiply_by_phase: phi must be C-contiguous"))?;
+    let phase = phase
+        .as_slice()
+        .map_err(|_| PyValueError::new_err("multiply_by_phase: phase must be C-contiguous"))?;
+    let phi = complex_as_cmplx_mut(phi);
+    let phase = complex_as_cmplx(phase);
+    py.detach(|| potential_change::multiply_by_phase(phi, phase));
+    Ok(())
+}
+
+/// Rotate the four spin components in spin space, in place.
+///
+/// ``values`` is a list of four C-contiguous complex128 arrays of the same
+/// shape, the spin components in the order [11, 12, 21, 22] of VASP, and
+/// ``spin_rotation`` the 2x2 complex128 matrix D.  At each element, the
+/// matrix V = [[v_0, v_1], [v_2, v_3]] is replaced by D V D^dagger.  The
+/// pure-Python counterpart is
+/// ``phelel.base.potential_change._rotate_spin_components_python``.  Raises
+/// ``ValueError`` for a wrong number of components, different shapes, a
+/// wrong shape of ``spin_rotation``, or non-contiguous arrays.
+#[pyfunction]
+#[pyo3(name = "rotate_spin_components")]
+fn py_rotate_spin_components<'py>(
+    py: Python<'py>,
+    mut values: Vec<PyReadwriteArrayDyn<'py, Complex64>>,
+    spin_rotation: PyReadonlyArray2<'py, Complex64>,
+) -> PyResult<()> {
+    if values.len() != 4 {
+        return Err(PyValueError::new_err(
+            "rotate_spin_components: values must have four spin components",
+        ));
+    }
+    let shape = values[0].shape().to_vec();
+    if values.iter().any(|v| v.shape() != shape.as_slice()) {
+        return Err(PyValueError::new_err(
+            "rotate_spin_components: spin components must have the same shape",
+        ));
+    }
+    if spin_rotation.shape() != [2, 2] {
+        return Err(PyValueError::new_err(
+            "rotate_spin_components: spin_rotation must have shape (2, 2)",
+        ));
+    }
+    let matrix = spin_rotation.as_array();
+    let element = |i: usize, j: usize| -> Cmplx { [matrix[[i, j]].re, matrix[[i, j]].im] };
+    let spin_rotation = [
+        [element(0, 0), element(0, 1)],
+        [element(1, 0), element(1, 1)],
+    ];
+    let mut slices = values
+        .iter_mut()
+        .map(|v| {
+            v.as_slice_mut().map(complex_as_cmplx_mut).map_err(|_| {
+                PyValueError::new_err(
+                    "rotate_spin_components: spin components must be C-contiguous",
+                )
+            })
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+    py.detach(|| potential_change::rotate_spin_components(&mut slices, &spin_rotation));
+    Ok(())
+}
+
+/// Apply time reversal to the spin components, in place.
+///
+/// ``values`` is a list of one, two or four C-contiguous complex128 arrays
+/// of the same shape: the spin components [11, 12, 21, 22] of VASP become
+/// [conj(v_3), -conj(v_2), -conj(v_1), conj(v_0)], the two collinear ones
+/// [conj(v_1), conj(v_0)], and one is conjugated.  The pure-Python
+/// counterpart is
+/// ``phelel.base.potential_change._apply_time_reversal_to_spin_components_python``.
+/// Raises ``ValueError`` for another number of components, different
+/// shapes, or non-contiguous arrays.
+#[pyfunction]
+#[pyo3(name = "apply_time_reversal_to_spin_components")]
+fn py_apply_time_reversal_to_spin_components<'py>(
+    py: Python<'py>,
+    mut values: Vec<PyReadwriteArrayDyn<'py, Complex64>>,
+) -> PyResult<()> {
+    if ![1, 2, 4].contains(&values.len()) {
+        return Err(PyValueError::new_err(
+            "apply_time_reversal_to_spin_components: values must have one, two or four spin components",
+        ));
+    }
+    let shape = values[0].shape().to_vec();
+    if values.iter().any(|v| v.shape() != shape.as_slice()) {
+        return Err(PyValueError::new_err(
+            "apply_time_reversal_to_spin_components: spin components must have the same shape",
+        ));
+    }
+    let mut slices = values
+        .iter_mut()
+        .map(|v| {
+            v.as_slice_mut().map(complex_as_cmplx_mut).map_err(|_| {
+                PyValueError::new_err(
+                    "apply_time_reversal_to_spin_components: spin components must be C-contiguous",
+                )
+            })
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+    py.detach(|| potential_change::apply_time_reversal_to_spin_components(&mut slices));
+    Ok(())
+}
+
+/// Add the outer products of ``displacement`` and the spin components to
+/// ``normal_equation_rhs``, in place.
+///
+/// ``normal_equation_rhs[c, i, i_grid] += displacement[i] * values[c][i_grid]``
+/// for each spin component c, Cartesian direction i and grid point i_grid.
+///
+/// * ``normal_equation_rhs`` - right-hand side of the normal equations, a
+///   C-contiguous complex128 array of the shape
+///   ``(len(values), 3, n_grid_points)``.
+/// * ``displacement`` - float64 array of the shape ``(3,)``, the rotated
+///   displacement R u_k in Cartesian coordinates in phelel.
+/// * ``values`` - list of the spin components of the potential change,
+///   C-contiguous complex128 arrays of ``n_grid_points`` elements each.
+///
+/// The pure-Python counterpart is
+/// ``phelel.base.potential_change._add_to_normal_equation_rhs_python``.  Raises
+/// ``ValueError`` for inconsistent shapes or non-contiguous arrays.
+#[pyfunction]
+#[pyo3(name = "add_to_normal_equation_rhs")]
+fn py_add_to_normal_equation_rhs<'py>(
+    py: Python<'py>,
+    mut normal_equation_rhs: PyReadwriteArray3<'py, Complex64>,
+    displacement: PyReadonlyArray1<'py, f64>,
+    values: Vec<PyReadonlyArrayDyn<'py, Complex64>>,
+) -> PyResult<()> {
+    let num_grid_points = values.first().map_or(0, |value| value.len());
+    if values.iter().any(|value| value.len() != num_grid_points) {
+        return Err(PyValueError::new_err(
+            "add_to_normal_equation_rhs: spin components must have the same number of elements",
+        ));
+    }
+    let displacement = displacement.as_array();
+    if displacement.len() != 3 {
+        return Err(PyValueError::new_err(
+            "add_to_normal_equation_rhs: displacement must have shape (3,)",
+        ));
+    }
+    let displacement = [displacement[0], displacement[1], displacement[2]];
+    if normal_equation_rhs.shape() != [values.len(), 3, num_grid_points] {
+        return Err(PyValueError::new_err(
+            "add_to_normal_equation_rhs: normal_equation_rhs must have shape (len(values), 3, n_grid_points)",
+        ));
+    }
+    let normal_equation_rhs = normal_equation_rhs.as_slice_mut().map_err(|_| {
+        PyValueError::new_err(
+            "add_to_normal_equation_rhs: normal_equation_rhs must be C-contiguous",
+        )
+    })?;
+    let slices = values
+        .iter()
+        .map(|value| {
+            value.as_slice().map(complex_as_cmplx).map_err(|_| {
+                PyValueError::new_err(
+                    "add_to_normal_equation_rhs: spin components must be C-contiguous",
+                )
+            })
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+    let normal_equation_rhs = complex_as_cmplx_mut(normal_equation_rhs);
+    py.detach(|| {
+        potential_change::add_to_normal_equation_rhs(normal_equation_rhs, &displacement, &slices)
+    });
+    Ok(())
+}
+
+/// Multiply ``normal_equation_rhs`` by pinv(U^T U) along the direction axis, in place.
+///
+/// For each spin component c and grid point i_grid, the three values
+/// ``normal_equation_rhs[c, :, i_grid]``, one for each Cartesian direction
+/// of the displacement, are replaced by
+/// ``inverse_normal_matrix @ normal_equation_rhs[c, :, i_grid]``.
+///
+/// * ``normal_equation_rhs`` - right-hand side of the normal equations,
+///   overwritten by the products (dV/du in phelel), a C-contiguous
+///   complex128 array of the shape ``(n_components, 3, n_grid_points)``.
+/// * ``inverse_normal_matrix`` - float64 array of the shape ``(3, 3)``, the
+///   pseudo-inverse pinv(U^T U) of the matrix of the normal equations.
+///
+/// The pure-Python counterpart is
+/// ``phelel.base.potential_change._apply_inverse_normal_matrix_python``.  Raises
+/// ``ValueError`` for wrong shapes or a non-contiguous ``normal_equation_rhs``.
+#[pyfunction]
+#[pyo3(name = "apply_inverse_normal_matrix")]
+fn py_apply_inverse_normal_matrix<'py>(
+    py: Python<'py>,
+    mut normal_equation_rhs: PyReadwriteArray3<'py, Complex64>,
+    inverse_normal_matrix: PyReadonlyArray2<'py, f64>,
+) -> PyResult<()> {
+    let num_grid_points = normal_equation_rhs.shape()[2];
+    if normal_equation_rhs.shape()[1] != 3 || num_grid_points == 0 {
+        return Err(PyValueError::new_err(
+            "apply_inverse_normal_matrix: normal_equation_rhs must have shape (n_components, 3, n_grid_points) with n_grid_points > 0",
+        ));
+    }
+    if inverse_normal_matrix.shape() != [3, 3] {
+        return Err(PyValueError::new_err(
+            "apply_inverse_normal_matrix: inverse_normal_matrix must have shape (3, 3)",
+        ));
+    }
+    let elements = inverse_normal_matrix.as_array();
+    let inverse_normal_matrix = [
+        [elements[[0, 0]], elements[[0, 1]], elements[[0, 2]]],
+        [elements[[1, 0]], elements[[1, 1]], elements[[1, 2]]],
+        [elements[[2, 0]], elements[[2, 1]], elements[[2, 2]]],
+    ];
+    let normal_equation_rhs = normal_equation_rhs.as_slice_mut().map_err(|_| {
+        PyValueError::new_err(
+            "apply_inverse_normal_matrix: normal_equation_rhs must be C-contiguous",
+        )
+    })?;
+    let normal_equation_rhs = complex_as_cmplx_mut(normal_equation_rhs);
+    py.detach(|| {
+        potential_change::apply_inverse_normal_matrix(
+            normal_equation_rhs,
+            &inverse_normal_matrix,
+            num_grid_points,
+        )
+    });
+    Ok(())
 }
 
 /// Rotate a BZ grid index and return the rotated point's BZ index.
@@ -6678,6 +6925,14 @@ fn phonors(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_transform_rotations, m)?)?;
     m.add_function(wrap_pyfunction!(py_bz_grid_addresses, m)?)?;
     m.add_function(wrap_pyfunction!(py_bin_supercell_fourier_coefficients, m)?)?;
+    m.add_function(wrap_pyfunction!(py_multiply_by_phase, m)?)?;
+    m.add_function(wrap_pyfunction!(py_rotate_spin_components, m)?)?;
+    m.add_function(wrap_pyfunction!(py_add_to_normal_equation_rhs, m)?)?;
+    m.add_function(wrap_pyfunction!(py_apply_inverse_normal_matrix, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        py_apply_time_reversal_to_spin_components,
+        m
+    )?)?;
     m.add_function(wrap_pyfunction!(py_rotate_bz_grid_index, m)?)?;
     m.add_function(wrap_pyfunction!(py_ir_triplets_at_q, m)?)?;
     m.add_function(wrap_pyfunction!(py_bz_triplets_at_q, m)?)?;
