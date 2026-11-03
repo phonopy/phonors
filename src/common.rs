@@ -41,6 +41,12 @@ pub fn cmplx_neg(a: Cmplx) -> Cmplx {
     [-a[0], -a[1]]
 }
 
+/// Product of a real number and a complex number.
+#[inline(always)]
+pub fn cmplx_scale(a: f64, b: Cmplx) -> Cmplx {
+    [a * b[0], a * b[1]]
+}
+
 pub const IDENTITY: MatI = [[1, 0, 0], [0, 1, 0], [0, 0, 1]];
 pub const INVERSION: MatI = [[-1, 0, 0], [0, -1, 0], [0, 0, -1]];
 

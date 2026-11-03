@@ -17,7 +17,7 @@
 
 use rayon::prelude::*;
 
-use crate::common::{cmplx_add, cmplx_conj, cmplx_mul, cmplx_neg, Cmplx, CMPLX_ZERO};
+use crate::common::{cmplx_add, cmplx_conj, cmplx_mul, cmplx_neg, cmplx_scale, Cmplx, CMPLX_ZERO};
 
 /// Number of elements given to one rayon task.
 const CHUNK_SIZE: usize = 4096;
@@ -184,6 +184,147 @@ pub fn apply_time_reversal_to_spin_components(values: &mut [&mut [Cmplx]]) {
     }
 }
 
+/// Add the outer products of `displacement` and the spin components to
+/// `normal_equation_rhs`.
+///
+/// For each spin component c, each Cartesian direction i = 0, 1, 2 of the
+/// displacement and each grid point i_grid,
+///
+/// ```text
+/// normal_equation_rhs[c][i][i_grid] += displacement[i] * values[c][i_grid].
+/// ```
+///
+/// In the finite-difference method of phelel (`_run_at_atom`),
+/// `displacement` is a rotated displacement R u_k and `values` are the spin
+/// components of the rotated change of the potential dV_kg at the grid
+/// points.  One call adds one term; the calls for all pairs (k, g) give the
+/// right-hand side U^T dV of the normal equations.
+///
+/// # Arguments
+///
+/// * `normal_equation_rhs` - Right-hand side of the normal equations, to
+///   which the products are added.  The elements [c][i][i_grid] for the
+///   spin components c, the directions i = 0, 1, 2 and the grid points
+///   i_grid are flattened in this order.
+/// * `displacement` - Displacement in Cartesian coordinates, R u_k in
+///   `_run_at_atom`.
+/// * `values` - Spin components of the potential change, one slice for each
+///   component, each with one value for each grid point.
+///
+/// Python counterpart: `_add_to_normal_equation_rhs_python`.
+///
+/// # Panics
+///
+/// If the spin components of `values` differ in length, or if the length of
+/// `normal_equation_rhs` is not 3 * `values.len()` times the length of a
+/// component.
+pub fn add_to_normal_equation_rhs(
+    normal_equation_rhs: &mut [Cmplx],
+    displacement: &[f64; 3],
+    values: &[&[Cmplx]],
+) {
+    let num_grid_points = values.first().map_or(0, |value| value.len());
+    assert!(
+        values.iter().all(|value| value.len() == num_grid_points),
+        "spin components differ in length"
+    );
+    assert_eq!(
+        normal_equation_rhs.len(),
+        values.len() * 3 * num_grid_points,
+        "normal_equation_rhs does not have the length of the outer products"
+    );
+    if num_grid_points == 0 {
+        return;
+    }
+    normal_equation_rhs
+        .par_chunks_mut(num_grid_points)
+        .enumerate()
+        .for_each(|(row, rhs_row)| {
+            let value = values[row / 3];
+            let displacement_component = displacement[row % 3];
+            rhs_row
+                .par_chunks_mut(CHUNK_SIZE)
+                .zip(value.par_chunks(CHUNK_SIZE))
+                .for_each(|(rhs_chunk, value_chunk)| {
+                    for (rhs_value, element) in rhs_chunk.iter_mut().zip(value_chunk) {
+                        *rhs_value =
+                            cmplx_add(*rhs_value, cmplx_scale(displacement_component, *element));
+                    }
+                });
+        });
+}
+
+/// Multiply `normal_equation_rhs` by pinv(U^T U) along the direction axis.
+///
+/// For each spin component c and each grid point i_grid, the three values
+/// `normal_equation_rhs[c][0..3][i_grid]`, one for each Cartesian direction
+/// of the displacement, form a vector, which is replaced by its product with
+/// `inverse_normal_matrix`:
+///
+/// ```text
+/// normal_equation_rhs[c][i][i_grid]
+///     <- sum_j inverse_normal_matrix[i][j] normal_equation_rhs[c][j][i_grid],
+/// ```
+///
+/// with the sum in the order of j.  In the finite-difference method of
+/// phelel (`_run_at_atom`), this turns the right-hand side of the normal
+/// equations into dV/du.
+///
+/// # Arguments
+///
+/// * `normal_equation_rhs` - Right-hand side of the normal equations,
+///   overwritten by the products (dV/du in `_run_at_atom`).  The elements
+///   [c][i][i_grid] for the spin components c, the directions i = 0, 1, 2
+///   and the grid points i_grid are flattened in this order.
+/// * `inverse_normal_matrix` - Pseudo-inverse pinv(U^T U) of the matrix
+///   U^T U of the normal equations, where the rows of U are the rotated
+///   displacements.
+/// * `num_grid_points` - Number of grid points.
+///
+/// Python counterpart: `_apply_inverse_normal_matrix_python`.
+///
+/// # Panics
+///
+/// If `num_grid_points` is zero, or if the length of `normal_equation_rhs`
+/// is not a multiple of 3 * `num_grid_points`.
+pub fn apply_inverse_normal_matrix(
+    normal_equation_rhs: &mut [Cmplx],
+    inverse_normal_matrix: &[[f64; 3]; 3],
+    num_grid_points: usize,
+) {
+    assert!(
+        num_grid_points > 0 && normal_equation_rhs.len() % (3 * num_grid_points) == 0,
+        "normal_equation_rhs is not made of three vectors of length num_grid_points"
+    );
+    normal_equation_rhs
+        .chunks_mut(3 * num_grid_points)
+        .for_each(|component| {
+            let (row_0, rest) = component.split_at_mut(num_grid_points);
+            let (row_1, row_2) = rest.split_at_mut(num_grid_points);
+            row_0
+                .par_chunks_mut(CHUNK_SIZE)
+                .zip(row_1.par_chunks_mut(CHUNK_SIZE))
+                .zip(row_2.par_chunks_mut(CHUNK_SIZE))
+                .for_each(|((chunk_0, chunk_1), chunk_2)| {
+                    for i_grid in 0..chunk_0.len() {
+                        let original = [chunk_0[i_grid], chunk_1[i_grid], chunk_2[i_grid]];
+                        let mut product = [CMPLX_ZERO; 3];
+                        for i in 0..3 {
+                            for j in 0..3 {
+                                product[i] = cmplx_add(
+                                    product[i],
+                                    cmplx_scale(inverse_normal_matrix[i][j], original[j]),
+                                );
+                            }
+                        }
+                        chunk_0[i_grid] = product[0];
+                        chunk_1[i_grid] = product[1];
+                        chunk_2[i_grid] = product[2];
+                    }
+                });
+        });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -332,5 +473,77 @@ mod tests {
     fn apply_time_reversal_to_spin_components_rejects_three_components() {
         let originals: Vec<Vec<Cmplx>> = (0..3).map(|k| random_values(4, k)).collect();
         time_reversed(&originals);
+    }
+
+    /// Two additions to a nonzero normal_equation_rhs, with two spin
+    /// components, against element-wise sums.
+    #[test]
+    fn add_to_normal_equation_rhs_agrees_with_elementwise_sums() {
+        let len = CHUNK_SIZE + 9;
+        let values_0: Vec<Vec<Cmplx>> = (0..2).map(|k| random_values(len, k + 30)).collect();
+        let values_1: Vec<Vec<Cmplx>> = (0..2).map(|k| random_values(len, k + 40)).collect();
+        let displacement_0 = [0.3, -1.2, 2.5];
+        let displacement_1 = [-0.7, 0.4, 1.1];
+        let start = random_values(2 * 3 * len, 50);
+        let mut normal_equation_rhs = start.clone();
+        let additions = [(&displacement_0, &values_0), (&displacement_1, &values_1)];
+        for (displacement, values) in additions {
+            let slices: Vec<&[Cmplx]> = values.iter().map(|v| v.as_slice()).collect();
+            add_to_normal_equation_rhs(&mut normal_equation_rhs, displacement, &slices);
+        }
+        for c in 0..2 {
+            for i in 0..3 {
+                for x in 0..len {
+                    let index = (c * 3 + i) * len + x;
+                    let mut expected = start[index];
+                    for (displacement, values) in additions {
+                        expected[0] += displacement[i] * values[c][x][0];
+                        expected[1] += displacement[i] * values[c][x][1];
+                    }
+                    assert_eq!(normal_equation_rhs[index], expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "normal_equation_rhs does not have the length of the outer products")]
+    fn add_to_normal_equation_rhs_rejects_wrong_length() {
+        let values = random_values(5, 1);
+        let mut normal_equation_rhs = random_values(2 * 3 * 5, 2);
+        add_to_normal_equation_rhs(&mut normal_equation_rhs, &[1.0, 2.0, 3.0], &[&values]);
+    }
+
+    /// Matrix-vector products for two spin components, against sums written
+    /// out for each element.
+    #[test]
+    fn apply_inverse_normal_matrix_agrees_with_matrix_vector_products() {
+        let len = CHUNK_SIZE + 9;
+        let matrix = [[1.5, -0.2, 0.3], [0.7, 2.1, -1.4], [-0.6, 0.8, 0.9]];
+        let original = random_values(2 * 3 * len, 60);
+        let mut normal_equation_rhs = original.clone();
+        apply_inverse_normal_matrix(&mut normal_equation_rhs, &matrix, len);
+        for c in 0..2 {
+            for i in 0..3 {
+                for x in 0..len {
+                    let mut expected = [0.0, 0.0];
+                    for j in 0..3 {
+                        let element = original[(c * 3 + j) * len + x];
+                        expected[0] += matrix[i][j] * element[0];
+                        expected[1] += matrix[i][j] * element[1];
+                    }
+                    assert_eq!(normal_equation_rhs[(c * 3 + i) * len + x], expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "normal_equation_rhs is not made of three vectors of length num_grid_points"
+    )]
+    fn apply_inverse_normal_matrix_rejects_wrong_length() {
+        let mut normal_equation_rhs = random_values(10, 1);
+        apply_inverse_normal_matrix(&mut normal_equation_rhs, &[[1.0, 0.0, 0.0]; 3], 3);
     }
 }
