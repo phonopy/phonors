@@ -27,6 +27,7 @@ mod grgrid;
 mod imag_self_energy;
 mod interaction;
 mod isotope;
+mod potential_change;
 mod pp_collision;
 mod real_self_energy;
 mod real_to_reciprocal;
@@ -504,6 +505,37 @@ fn py_bin_supercell_fourier_coefficients<'py>(
     .map_err(err)?;
     drop(rws);
     Ok(outs)
+}
+
+/// Multiply ``phi`` by ``phase`` element by element, in place.
+///
+/// ``phi`` and ``phase`` are C-contiguous complex128 arrays of the same
+/// shape.  This is a step of ``FourierSeriesOnGrid.get_phi`` in phelel,
+/// whose pure-Python counterpart is
+/// ``phelel.base.potential_change._multiply_by_phase_python``.  Raises
+/// ``ValueError`` for different shapes or non-contiguous arrays.
+#[pyfunction]
+#[pyo3(name = "multiply_by_phase")]
+fn py_multiply_by_phase<'py>(
+    py: Python<'py>,
+    mut phi: PyReadwriteArrayDyn<'py, Complex64>,
+    phase: PyReadonlyArrayDyn<'py, Complex64>,
+) -> PyResult<()> {
+    if phi.shape() != phase.shape() {
+        return Err(PyValueError::new_err(
+            "multiply_by_phase: phi and phase must have the same shape",
+        ));
+    }
+    let phi = phi
+        .as_slice_mut()
+        .map_err(|_| PyValueError::new_err("multiply_by_phase: phi must be C-contiguous"))?;
+    let phase = phase
+        .as_slice()
+        .map_err(|_| PyValueError::new_err("multiply_by_phase: phase must be C-contiguous"))?;
+    let phi = complex_as_cmplx_mut(phi);
+    let phase = complex_as_cmplx(phase);
+    py.detach(|| potential_change::multiply_by_phase(phi, phase));
+    Ok(())
 }
 
 /// Rotate a BZ grid index and return the rotated point's BZ index.
@@ -6678,6 +6710,7 @@ fn phonors(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_transform_rotations, m)?)?;
     m.add_function(wrap_pyfunction!(py_bz_grid_addresses, m)?)?;
     m.add_function(wrap_pyfunction!(py_bin_supercell_fourier_coefficients, m)?)?;
+    m.add_function(wrap_pyfunction!(py_multiply_by_phase, m)?)?;
     m.add_function(wrap_pyfunction!(py_rotate_bz_grid_index, m)?)?;
     m.add_function(wrap_pyfunction!(py_ir_triplets_at_q, m)?)?;
     m.add_function(wrap_pyfunction!(py_bz_triplets_at_q, m)?)?;
