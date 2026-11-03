@@ -538,6 +538,59 @@ fn py_multiply_by_phase<'py>(
     Ok(())
 }
 
+/// Rotate the four spin components in spin space, in place.
+///
+/// ``values`` is a list of four C-contiguous complex128 arrays of the same
+/// shape, the spin components in the order [11, 12, 21, 22] of VASP, and
+/// ``spin_rotation`` the 2x2 complex128 matrix D.  At each element, the
+/// matrix V = [[v_0, v_1], [v_2, v_3]] is replaced by D V D^dagger.  The
+/// pure-Python counterpart is
+/// ``phelel.base.potential_change._rotate_spin_components_python``.  Raises
+/// ``ValueError`` for a wrong number of components, different shapes, a
+/// wrong shape of ``spin_rotation``, or non-contiguous arrays.
+#[pyfunction]
+#[pyo3(name = "rotate_spin_components")]
+fn py_rotate_spin_components<'py>(
+    py: Python<'py>,
+    mut values: Vec<PyReadwriteArrayDyn<'py, Complex64>>,
+    spin_rotation: PyReadonlyArray2<'py, Complex64>,
+) -> PyResult<()> {
+    if values.len() != 4 {
+        return Err(PyValueError::new_err(
+            "rotate_spin_components: values must have four spin components",
+        ));
+    }
+    let shape = values[0].shape().to_vec();
+    if values.iter().any(|v| v.shape() != shape.as_slice()) {
+        return Err(PyValueError::new_err(
+            "rotate_spin_components: spin components must have the same shape",
+        ));
+    }
+    if spin_rotation.shape() != [2, 2] {
+        return Err(PyValueError::new_err(
+            "rotate_spin_components: spin_rotation must have shape (2, 2)",
+        ));
+    }
+    let matrix = spin_rotation.as_array();
+    let element = |i: usize, j: usize| -> Cmplx { [matrix[[i, j]].re, matrix[[i, j]].im] };
+    let spin_rotation = [
+        [element(0, 0), element(0, 1)],
+        [element(1, 0), element(1, 1)],
+    ];
+    let mut slices = values
+        .iter_mut()
+        .map(|v| {
+            v.as_slice_mut().map(complex_as_cmplx_mut).map_err(|_| {
+                PyValueError::new_err(
+                    "rotate_spin_components: spin components must be C-contiguous",
+                )
+            })
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+    py.detach(|| potential_change::rotate_spin_components(&mut slices, &spin_rotation));
+    Ok(())
+}
+
 /// Rotate a BZ grid index and return the rotated point's BZ index.
 ///
 /// ``bz_grid_type`` is 1 for the sparse layout or 2 for the dense layout.
@@ -6711,6 +6764,7 @@ fn phonors(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_bz_grid_addresses, m)?)?;
     m.add_function(wrap_pyfunction!(py_bin_supercell_fourier_coefficients, m)?)?;
     m.add_function(wrap_pyfunction!(py_multiply_by_phase, m)?)?;
+    m.add_function(wrap_pyfunction!(py_rotate_spin_components, m)?)?;
     m.add_function(wrap_pyfunction!(py_rotate_bz_grid_index, m)?)?;
     m.add_function(wrap_pyfunction!(py_ir_triplets_at_q, m)?)?;
     m.add_function(wrap_pyfunction!(py_bz_triplets_at_q, m)?)?;
