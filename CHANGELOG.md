@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `multiply_by_phase`, `rotate_spin_components`,
+  `apply_time_reversal_to_spin_components`, `add_to_normal_equation_rhs`
+  and `apply_inverse_normal_matrix`, the element-wise steps of the
+  finite-difference derivative of the local potential in phelel.  Each
+  works in place and in parallel.
+
 ## [0.7.0] - 2026-11-01
 
 ### Added
