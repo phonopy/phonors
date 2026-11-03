@@ -1,10 +1,9 @@
 use numpy::ndarray::{Array1, Array2, Array3};
 use numpy::{
-    Complex64, IntoPyArray, PyArray1, PyArray2, PyArray3, PyArray4, PyArrayMethods,
-    PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArray3, PyReadonlyArray4, PyReadonlyArray5,
-    PyReadonlyArray6, PyReadonlyArrayDyn, PyReadwriteArray1, PyReadwriteArray2, PyReadwriteArray3,
-    PyReadwriteArray4, PyReadwriteArray5, PyReadwriteArray6, PyReadwriteArrayDyn,
-    PyUntypedArrayMethods,
+    Complex64, IntoPyArray, PyArray1, PyArray2, PyArray3, PyArrayMethods, PyReadonlyArray1,
+    PyReadonlyArray2, PyReadonlyArray3, PyReadonlyArray4, PyReadonlyArray5, PyReadonlyArray6,
+    PyReadonlyArrayDyn, PyReadwriteArray1, PyReadwriteArray2, PyReadwriteArray3, PyReadwriteArray4,
+    PyReadwriteArray5, PyReadwriteArray6, PyReadwriteArrayDyn, PyUntypedArrayMethods,
 };
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -341,8 +340,8 @@ fn py_bz_grid_addresses<'py>(
 }
 
 /// ValueError for an error of the binning functions of `fourier_bins`.
-fn bin_error(name: &str, e: fourier_bins::BinSupercellFourierCoefficientsError) -> PyErr {
-    use fourier_bins::BinSupercellFourierCoefficientsError as E;
+fn bin_error(name: &str, e: fourier_bins::FourierBinsError) -> PyErr {
+    use fourier_bins::FourierBinsError as E;
     let message = match e {
         E::SingularP2sMatrix => "p2s_matrix is singular",
         E::NonUnimodularRotation => "determinant of rotation must be +1 or -1",
@@ -350,231 +349,116 @@ fn bin_error(name: &str, e: fourier_bins::BinSupercellFourierCoefficientsError) 
         E::NonPositiveMesh => "mesh numbers must be positive",
         E::TooLarge => "number of rows or bins exceeds 2^32",
         E::LengthMismatch => "lengths of the arrays do not agree",
-        E::SourceOutOfRange => "source is out of range",
-        E::MeshNotInvariant => "the supercell FFT mesh is not invariant under rotation",
-        E::InvalidBinOffsets => {
-            "bin_offsets must go from 0 to the number of rows without decreasing"
+        E::InvalidOffsets => {
+            "offsets must go from 0 to the number of rows without decreasing, \
+             in the order of the rows"
         }
     };
     PyValueError::new_err(format!("{name}: {message}"))
 }
 
-/// Sum the Fourier coefficients of a supercell by q and K mod N^p.
+/// Rows of an int64 array of the shape ``(n, 3)``, C-contiguous.
 ///
-/// ``coefficients`` is a list of complex128 arrays of the shape
-/// ``(N^s_3, N^s_2, N^s_1)`` of the supercell FFT mesh.  The rows of the
-/// series are the box ``-ceil(N^s_k / 2) + 1 <= g_k <= floor(N^s_k / 2)``
-/// with the coefficient ``c.ravel()[j]`` of row ``j``, or, when ``g``
-/// ``(n, 3)`` is given, the rows of ``g`` with the coefficient
-/// ``c.ravel()[source[j]] * weight[j]``.  ``rotation`` and ``translation``
-/// are those of a space-group operation acting as
-/// ``x -> rotation @ x + translation`` in the fractional coordinates of the
-/// supercell.  For ``g' = g @ inv(rotation)`` and
+/// ``as_slice`` accepts Fortran order too, so C order is checked first.
+fn rows_of<'a>(
+    name: &str,
+    what: &str,
+    array: &'a PyReadonlyArray2<'_, i64>,
+) -> PyResult<&'a [[i64; 3]]> {
+    if array.shape().len() != 2 || array.shape()[1] != 3 {
+        return Err(PyValueError::new_err(format!(
+            "{name}: {what} must have shape (n, 3)"
+        )));
+    }
+    let not_contiguous = || PyValueError::new_err(format!("{name}: {what} must be C-contiguous"));
+    if !array.is_c_contiguous() {
+        return Err(not_contiguous());
+    }
+    Ok(group_as_array::<i64, 3>(
+        array.as_slice().map_err(|_| not_contiguous())?,
+    ))
+}
+
+/// Sort the rotated representatives by bin.  Returns ``(g_sorted, bin_offsets)``.
+///
+/// ``g`` is an int64 array ``(n, 3)`` of the representatives g~ (integer
+/// vectors in the reciprocal basis of the supercell) and ``rotation`` the
+/// rotation W of an operation (the identity when None).  For
+/// ``g' = g @ inv(rotation)`` (W^-T g~ as column vectors) and
 /// ``h = g' @ inv(p2s_matrix)`` split into the integer part ``K`` and the
-/// fractional part ``q``, the coefficient times
-/// ``exp(-2 pi i g' . translation)`` is added to ``F[i_q, Kbar_3, Kbar_2,
-/// Kbar_1]`` with ``Kbar = K mod fft_mesh``.  With the Smith normal form
-/// ``P @ p2s_matrix @ Q = diag(d)`` of ``snf3x3``, ``i_q`` is the C-order
-/// index of ``(g' @ Q) mod d`` over ``d``.  Each bin is summed in the
-/// order of the rows, as ``np.bincount``, for any number of threads.
-///
-/// Returns a list of complex128 arrays of the shape
-/// ``(N_c, fft_mesh[2], fft_mesh[1], fft_mesh[0])`` with
-/// ``N_c = |det(p2s_matrix)|``.  Raises ``ValueError`` for inconsistent
-/// shapes, a singular ``p2s_matrix``, ``rotation`` with determinant other
-/// than +1 or -1, a non-positive mesh, or ``source`` out of range.
+/// fractional part ``q``, the bin of g' is the C-order index of
+/// ``(i_q, Kbar_3, Kbar_2, Kbar_1)`` in ``(N_c, fft_mesh[2], fft_mesh[1],
+/// fft_mesh[0])`` with ``Kbar = K mod fft_mesh``, ``N_c =
+/// |det(p2s_matrix)|`` and ``i_q`` the C-order index of ``(g' @ Q) mod d``
+/// over ``d`` for the Smith normal form ``P @ p2s_matrix @ Q = diag(d)`` of
+/// ``snf3x3``.  ``g_sorted`` (n, 3) are the g' in the order of (bin, row),
+/// and those of bin ``b`` are ``g_sorted[bin_offsets[b]:bin_offsets[b +
+/// 1]]``; ``bin_offsets`` has the length ``N_c * prod(fft_mesh) + 1``.  This
+/// is a step of ``FourierSeriesOnGrid`` in phelel, whose pure-Python
+/// counterpart is in ``phelel.base.fourier_series``.  Raises ``ValueError``
+/// for a wrong shape, ``g`` that is not C-contiguous, a singular
+/// ``p2s_matrix``, a non-positive ``fft_mesh``, ``rotation`` with
+/// determinant other than +1 or -1, or more than 2^32 rows or bins.
 #[pyfunction]
 #[pyo3(
-    name = "bin_supercell_fourier_coefficients",
-    signature = (
-        coefficients,
-        p2s_matrix,
-        fft_mesh,
-        rotation=None,
-        translation=None,
-        g=None,
-        source=None,
-        weight=None,
-    )
+    name = "sort_rows_by_bin",
+    signature = (g, p2s_matrix, fft_mesh, rotation=None)
 )]
-fn py_bin_supercell_fourier_coefficients<'py>(
+fn py_sort_rows_by_bin<'py>(
     py: Python<'py>,
-    coefficients: Vec<PyReadonlyArray3<'py, Complex64>>,
+    g: PyReadonlyArray2<'py, i64>,
     p2s_matrix: PyReadonlyArray2<'py, i64>,
     fft_mesh: PyReadonlyArray1<'py, i64>,
     rotation: Option<PyReadonlyArray2<'py, i64>>,
-    translation: Option<PyReadonlyArray1<'py, f64>>,
-    g: Option<PyReadonlyArray2<'py, i64>>,
-    source: Option<PyReadonlyArray1<'py, i64>>,
-    weight: Option<PyReadonlyArray1<'py, f64>>,
-) -> PyResult<Vec<Bound<'py, PyArray4<Complex64>>>> {
-    let shape = match coefficients.first() {
-        Some(c) => c.shape().to_vec(),
-        None => return Err(PyValueError::new_err("coefficients must not be empty")),
-    };
-    if coefficients.iter().any(|c| c.shape() != shape.as_slice()) {
-        return Err(PyValueError::new_err(
-            "coefficients must have the same shape",
-        ));
-    }
-    let mesh = [shape[2] as i64, shape[1] as i64, shape[0] as i64];
+) -> PyResult<(Bound<'py, PyArray2<i64>>, Bound<'py, PyArray1<i64>>)> {
+    let name = "sort_rows_by_bin";
+    let rows = rows_of(name, "g", &g)?;
     let p2s = mat3_i(&p2s_matrix)?;
     let pm = vec3_i(&fft_mesh)?;
     let rot = match &rotation {
         Some(r) => mat3_i(r)?,
         None => crate::common::IDENTITY,
     };
-    let trans = match &translation {
-        Some(t) => {
-            let v = t.as_array();
-            if v.len() != 3 {
-                return Err(PyValueError::new_err("translation must have shape (3,)"));
-            }
-            Some([v[0], v[1], v[2]])
-        }
-        None => None,
-    };
-    let reps = match (&g, &source, &weight) {
-        (None, None, None) => None,
-        (Some(g), Some(source), Some(weight)) => {
-            if g.shape().len() != 2 || g.shape()[1] != 3 {
-                return Err(PyValueError::new_err("g must have shape (n, 3)"));
-            }
-            let g = g
-                .as_slice()
-                .map_err(|_| PyValueError::new_err("g must be C-contiguous"))?;
-            let source = source
-                .as_slice()
-                .map_err(|_| PyValueError::new_err("source must be C-contiguous"))?;
-            let weight = weight
-                .as_slice()
-                .map_err(|_| PyValueError::new_err("weight must be C-contiguous"))?;
-            Some(fourier_bins::Representatives {
-                g: group_as_array::<i64, 3>(g),
-                source,
-                weight,
-            })
-        }
-        _ => {
-            return Err(PyValueError::new_err(
-                "g, source, and weight must be given together",
-            ))
-        }
-    };
-    let cs = coefficients
-        .iter()
-        .map(|c| {
-            c.as_slice()
-                .map(complex_as_cmplx)
-                .map_err(|_| PyValueError::new_err("coefficients must be C-contiguous"))
-        })
-        .collect::<PyResult<Vec<_>>>()?;
-
-    let err = |e| bin_error("bin_supercell_fourier_coefficients", e);
-    let num_cells = fourier_bins::num_bins(p2s, [1, 1, 1]).map_err(err)?;
-    fourier_bins::num_bins(p2s, pm).map_err(err)?;
-    let outs: Vec<Bound<'py, PyArray4<Complex64>>> = (0..cs.len())
-        .map(|_| {
-            PyArray4::zeros(
-                py,
-                [num_cells, pm[2] as usize, pm[1] as usize, pm[0] as usize],
-                false,
-            )
-        })
-        .collect();
-    let mut rws: Vec<_> = outs.iter().map(|a| a.readwrite()).collect();
-    let mut fs = rws
-        .iter_mut()
-        .map(|rw| {
-            rw.as_slice_mut()
-                .map(complex_as_cmplx_mut)
-                .map_err(|_| PyRuntimeError::new_err("output is not contiguous"))
-        })
-        .collect::<PyResult<Vec<_>>>()?;
-    py.detach(|| {
-        fourier_bins::bin_supercell_fourier_coefficients(
-            &mut fs, &cs, mesh, p2s, pm, rot, trans, reps,
-        )
-    })
-    .map_err(err)?;
-    drop(rws);
-    Ok(outs)
-}
-
-/// Sort the rows ``g`` by their bin.  Returns ``(order, bin_offsets)``.
-///
-/// ``g`` is an int64 array ``(n, 3)`` of integer vectors in the reciprocal
-/// basis of the supercell, typically the shortest representatives.  The bin
-/// of a row is the index ``i_F`` of ``bin_supercell_fourier_coefficients``
-/// for the row itself (no rotation).  ``order`` (length ``n``) lists the
-/// rows by (bin, row), and the rows of bin ``b`` are
-/// ``order[bin_offsets[b]:bin_offsets[b + 1]]``; ``bin_offsets`` has the
-/// length ``N_c * prod(fft_mesh) + 1``.  This is a step of
-/// ``FourierSeriesOnGrid`` in phelel, whose pure-Python counterpart is in
-/// ``phelel.base.fourier_series``.  Raises ``ValueError`` for a wrong shape,
-/// ``g`` that is not C-contiguous, a singular ``p2s_matrix``, a non-positive
-/// ``fft_mesh``, or more than 2^32 rows or bins.
-#[pyfunction]
-#[pyo3(name = "sort_rows_by_bin")]
-fn py_sort_rows_by_bin<'py>(
-    py: Python<'py>,
-    g: PyReadonlyArray2<'py, i64>,
-    p2s_matrix: PyReadonlyArray2<'py, i64>,
-    fft_mesh: PyReadonlyArray1<'py, i64>,
-) -> PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<i64>>)> {
-    if g.shape().len() != 2 || g.shape()[1] != 3 {
-        return Err(PyValueError::new_err(
-            "sort_rows_by_bin: g must have shape (n, 3)",
-        ));
-    }
-    // as_slice accepts Fortran order too, so C order is checked first.
-    let not_contiguous = || PyValueError::new_err("sort_rows_by_bin: g must be C-contiguous");
-    if !g.is_c_contiguous() {
-        return Err(not_contiguous());
-    }
-    let rows = g.as_slice().map_err(|_| not_contiguous())?;
-    let rows = group_as_array::<i64, 3>(rows);
-    let p2s = mat3_i(&p2s_matrix)?;
-    let pm = vec3_i(&fft_mesh)?;
     let sorted = py
-        .detach(|| fourier_bins::sort_rows_by_bin(rows, p2s, pm))
-        .map_err(|e| bin_error("sort_rows_by_bin", e))?;
+        .detach(|| fourier_bins::sort_rows_by_bin(rows, p2s, pm, rot))
+        .map_err(|e| bin_error(name, e))?;
     Ok((
-        sorted.order.into_pyarray(py),
+        addresses_to_array(py, sorted.g_sorted),
         sorted.bin_offsets.into_pyarray(py),
     ))
 }
 
-/// Sum the Fourier coefficients by bin with the rows sorted by bin once.
+/// Sum the Fourier coefficients by bin over the rows sorted by bin.
 ///
 /// ``coefficients`` is a list of complex128 arrays of the shape
 /// ``(N^s_3, N^s_2, N^s_1)`` of the supercell FFT mesh.  ``g_sorted``
-/// ``(n, 3)`` are the shortest representatives in the order of
-/// ``sort_rows_by_bin``, and the rows of bin ``b`` are
-/// ``g_sorted[bin_offsets[b]:bin_offsets[b + 1]]``.  ``class_weight`` has
-/// the length ``N^s_1 N^s_2 N^s_3`` and is 1 / (number of representatives)
-/// of each class ``g mod N^s``.  For each row ``g'`` and
-/// ``g = rotation.T @ g'``, ``c.ravel()[s] * class_weight[s] *
-/// exp(-2 pi i g' . translation)`` is added to its bin, where ``s`` is the
-/// flat index of ``g mod N^s`` with ``g_1`` fastest.  This equals
-/// ``bin_supercell_fourier_coefficients`` with the same representatives up
-/// to rounding, when the supercell FFT mesh is invariant under
-/// ``rotation``, which is checked.  This is a step of
-/// ``FourierSeriesOnGrid`` in phelel, whose pure-Python counterpart is in
-/// ``phelel.base.fourier_series``.
+/// ``(n, 3)`` and ``bin_offsets`` are those of ``sort_rows_by_bin``: the
+/// rows of bin ``b`` are ``g_sorted[bin_offsets[b]:bin_offsets[b + 1]]``.
+/// The source of an integer vector g is the index of ``g mod N^s`` in
+/// ``coefficients[0].ravel()`` (g_1 fastest), and ``source_weight`` (length
+/// ``N^s_1 N^s_2 N^s_3``) is 1 / (number of representatives) for each
+/// source.  For each row ``g'`` and ``g = rotation.T @ g'``,
+/// ``c.ravel()[s] * source_weight[s] * exp(-2 pi i g' . translation)`` with
+/// the source ``s`` of g is added to bin ``b``.  With ``g_sorted`` from
+/// ``sort_rows_by_bin`` with the same ``rotation``, this is the binned
+/// Fourier series of the function rotated by the operation
+/// ``x -> rotation @ x + translation`` in the fractional coordinates of the
+/// supercell.  With ``g_sorted`` from ``sort_rows_by_bin`` without rotation,
+/// it is the same up to rounding when ``rows_closed_under_rotation`` is
+/// true.  This is a step of ``FourierSeriesOnGrid`` in phelel, whose
+/// pure-Python counterpart is in ``phelel.base.fourier_series``.
 ///
 /// Returns a list of flat complex128 arrays of the length
 /// ``len(bin_offsets) - 1``.  Raises ``ValueError`` for inconsistent shapes
 /// or lengths, arrays that are not C-contiguous, invalid ``bin_offsets``,
-/// ``rotation`` with determinant other than +1 or -1, or a supercell FFT
-/// mesh that is not invariant under ``rotation``.
+/// or ``rotation`` with determinant other than +1 or -1.
 #[pyfunction]
 #[pyo3(
     name = "bin_sorted_supercell_fourier_coefficients",
     signature = (
         coefficients,
         g_sorted,
-        class_weight,
+        source_weight,
         bin_offsets,
         rotation=None,
         translation=None,
@@ -584,7 +468,7 @@ fn py_bin_sorted_supercell_fourier_coefficients<'py>(
     py: Python<'py>,
     coefficients: Vec<PyReadonlyArray3<'py, Complex64>>,
     g_sorted: PyReadonlyArray2<'py, i64>,
-    class_weight: PyReadonlyArray1<'py, f64>,
+    source_weight: PyReadonlyArray1<'py, f64>,
     bin_offsets: PyReadonlyArray1<'py, i64>,
     rotation: Option<PyReadonlyArray2<'py, i64>>,
     translation: Option<PyReadonlyArray1<'py, f64>>,
@@ -603,27 +487,16 @@ fn py_bin_sorted_supercell_fourier_coefficients<'py>(
             "{name}: coefficients must have the same shape"
         )));
     }
-    let mesh = [shape[2] as i64, shape[1] as i64, shape[0] as i64];
-    if g_sorted.shape().len() != 2 || g_sorted.shape()[1] != 3 {
-        return Err(PyValueError::new_err(format!(
-            "{name}: g_sorted must have shape (n, 3)"
-        )));
-    }
+    let supercell_mesh = [shape[2] as i64, shape[1] as i64, shape[0] as i64];
     let contiguous =
         |what: &str| PyValueError::new_err(format!("{name}: {what} must be C-contiguous"));
-    // as_slice accepts Fortran order too, so C order is checked first for
-    // the arrays of more than one dimension.
-    if !g_sorted.is_c_contiguous() {
-        return Err(contiguous("g_sorted"));
-    }
     if coefficients.iter().any(|c| !c.is_c_contiguous()) {
         return Err(contiguous("coefficients"));
     }
-    let g_sorted =
-        group_as_array::<i64, 3>(g_sorted.as_slice().map_err(|_| contiguous("g_sorted"))?);
-    let class_weight = class_weight
+    let g_sorted = rows_of(name, "g_sorted", &g_sorted)?;
+    let source_weight = source_weight
         .as_slice()
-        .map_err(|_| contiguous("class_weight"))?;
+        .map_err(|_| contiguous("source_weight"))?;
     let bin_offsets = bin_offsets
         .as_slice()
         .map_err(|_| contiguous("bin_offsets"))?;
@@ -670,9 +543,9 @@ fn py_bin_sorted_supercell_fourier_coefficients<'py>(
         fourier_bins::bin_sorted_supercell_fourier_coefficients(
             &mut fs,
             &cs,
-            mesh,
+            supercell_mesh,
             g_sorted,
-            class_weight,
+            source_weight,
             bin_offsets,
             rot,
             trans,
@@ -681,6 +554,40 @@ fn py_bin_sorted_supercell_fourier_coefficients<'py>(
     .map_err(|e| bin_error(name, e))?;
     drop(rws);
     Ok(outs)
+}
+
+/// Whether ``inv(rotation).T`` maps the representatives ``g`` onto themselves.
+///
+/// ``g`` is an int64 array ``(n, 3)`` of the representatives in the order
+/// of their source (the index of ``g mod supercell_mesh`` in the flattened
+/// coefficient array, g_1 fastest): those with source ``s`` are
+/// ``g[source_offsets[s]:source_offsets[s + 1]]``.  Returns True when, for
+/// every row g, ``g @ inv(rotation)`` (W^-T g as column vectors) is one of
+/// the representatives with its source.  Then ``sort_rows_by_bin`` without
+/// rotation can be used for this rotation.  This is a step of
+/// ``FourierSeriesOnGrid`` in phelel, whose pure-Python counterpart is in
+/// ``phelel.base.fourier_series``.  Raises ``ValueError`` for a wrong shape
+/// or length, ``g`` that is not C-contiguous, ``g`` not in the order of
+/// ``source_offsets``, a non-positive ``supercell_mesh``, or ``rotation``
+/// with determinant other than +1 or -1.
+#[pyfunction]
+#[pyo3(name = "rows_closed_under_rotation")]
+fn py_rows_closed_under_rotation<'py>(
+    py: Python<'py>,
+    g: PyReadonlyArray2<'py, i64>,
+    source_offsets: PyReadonlyArray1<'py, i64>,
+    supercell_mesh: PyReadonlyArray1<'py, i64>,
+    rotation: PyReadonlyArray2<'py, i64>,
+) -> PyResult<bool> {
+    let name = "rows_closed_under_rotation";
+    let rows = rows_of(name, "g", &g)?;
+    let offsets = source_offsets.as_slice().map_err(|_| {
+        PyValueError::new_err(format!("{name}: source_offsets must be C-contiguous"))
+    })?;
+    let mesh = vec3_i(&supercell_mesh)?;
+    let rot = mat3_i(&rotation)?;
+    py.detach(|| fourier_bins::rows_closed_under_rotation(rows, offsets, mesh, rot))
+        .map_err(|e| bin_error(name, e))
 }
 
 /// Multiply ``phi`` by ``phase`` element by element, in place.
@@ -7100,7 +7007,7 @@ fn phonors(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_reciprocal_rotations, m)?)?;
     m.add_function(wrap_pyfunction!(py_transform_rotations, m)?)?;
     m.add_function(wrap_pyfunction!(py_bz_grid_addresses, m)?)?;
-    m.add_function(wrap_pyfunction!(py_bin_supercell_fourier_coefficients, m)?)?;
+    m.add_function(wrap_pyfunction!(py_rows_closed_under_rotation, m)?)?;
     m.add_function(wrap_pyfunction!(py_sort_rows_by_bin, m)?)?;
     m.add_function(wrap_pyfunction!(
         py_bin_sorted_supercell_fourier_coefficients,
