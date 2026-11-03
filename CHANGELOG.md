@@ -13,6 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `apply_inverse_normal_matrix`, the element-wise steps of the
   finite-difference derivative of the local potential in phelel.  Each
   works in place and in parallel.
+- `sort_rows_by_bin` and `bin_sorted_supercell_fourier_coefficients`.  The
+  shortest representatives are sorted by bin once, and the Fourier
+  coefficients are binned with them for every symmetry operation that keeps
+  the FFT mesh of the supercell, without sorting for each operation.
 
 ## [0.7.0] - 2026-11-01
 

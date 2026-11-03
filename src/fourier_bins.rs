@@ -38,7 +38,9 @@
 
 use rayon::prelude::*;
 
-use crate::common::{cmplx_mul, det_i, matvec_ii, transpose_i, Cmplx, MatI, Vec3D, Vec3I};
+use crate::common::{
+    cmplx_mul, det_i, matvec_ii, transpose_i, Cmplx, MatI, Vec3D, Vec3I, CMPLX_ZERO,
+};
 use crate::snf3x3::snf3x3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,6 +59,11 @@ pub enum BinSupercellFourierCoefficientsError {
     LengthMismatch,
     /// An element of source is outside [0, N^s_1 N^s_2 N^s_3).
     SourceOutOfRange,
+    /// The supercell FFT mesh is not invariant under the rotation.
+    MeshNotInvariant,
+    /// bin_offsets does not go from 0 to the number of rows without
+    /// decreasing.
+    InvalidBinOffsets,
 }
 
 /// Explicitly given g with the coefficient c[source[j]] * weight[j] of row j.
@@ -276,35 +283,14 @@ pub fn bin_supercell_fourier_coefficients(
         .collect();
     keys.par_sort_unstable();
 
-    let phase = |gp: Vec3I| -> Option<Cmplx> {
-        translation.map(|w| {
-            let two_pi = 2.0 * std::f64::consts::PI;
-            let arg = (-two_pi * gp[0] as f64) * w[0]
-                + (-two_pi * gp[1] as f64) * w[1]
-                + (-two_pi * gp[2] as f64) * w[2];
-            let (s, c) = arg.sin_cos();
-            [c, s]
-        })
-    };
+    let phase = |gp: Vec3I| -> Option<Cmplx> { translation.map(|w| translation_phase(gp, w)) };
 
-    // Split the bins into ranges and the sorted keys at the same bins, so
-    // that each task writes its own part of every output.
-    let num_bins = num_bins as usize;
-    let num_tasks = (rayon::current_num_threads() * 8).min(num_bins).max(1);
-    let bin_bounds: Vec<usize> = (0..=num_tasks).map(|t| t * num_bins / num_tasks).collect();
+    // Split the sorted keys at the bins of the tasks.
+    let (bin_bounds, parts) = split_bins(fs, num_bins as usize);
     let key_bounds: Vec<usize> = bin_bounds
         .iter()
         .map(|&b| keys.partition_point(|&k| ((k >> 32) as usize) < b))
         .collect();
-    let mut parts: Vec<Vec<&mut [Cmplx]>> = (0..num_tasks).map(|_| Vec::new()).collect();
-    for f in fs.iter_mut() {
-        let mut rest: &mut [Cmplx] = f;
-        for t in 0..num_tasks {
-            let (part, tail) = rest.split_at_mut(bin_bounds[t + 1] - bin_bounds[t]);
-            parts[t].push(part);
-            rest = tail;
-        }
-    }
 
     parts.into_par_iter().enumerate().for_each(|(t, mut outs)| {
         let mut sums = vec![[0.0f64; 2]; coefficients.len()];
@@ -323,6 +309,192 @@ pub fn bin_supercell_fourier_coefficients(
                     sum[1] += v[1];
                 }
                 pos += 1;
+            }
+            for (out, sum) in outs.iter_mut().zip(&sums) {
+                out[local] = *sum;
+            }
+        }
+    });
+    Ok(())
+}
+
+/// exp(-2 pi i g' . w^s) for the integer vector g' and the translation w^s.
+fn translation_phase(gp: Vec3I, w: Vec3D) -> Cmplx {
+    let two_pi = 2.0 * std::f64::consts::PI;
+    let arg = (-two_pi * gp[0] as f64) * w[0]
+        + (-two_pi * gp[1] as f64) * w[1]
+        + (-two_pi * gp[2] as f64) * w[2];
+    let (s, c) = arg.sin_cos();
+    [c, s]
+}
+
+/// Split the bins 0..num_bins into one range per task, and every output at
+/// the same bins, so that each task writes its own part of every output.
+/// Returns the bounds of the ranges and, for each task, its parts of the
+/// outputs.
+fn split_bins<'a>(
+    fs: &'a mut [&mut [Cmplx]],
+    num_bins: usize,
+) -> (Vec<usize>, Vec<Vec<&'a mut [Cmplx]>>) {
+    let num_tasks = (rayon::current_num_threads() * 8).min(num_bins).max(1);
+    let bin_bounds: Vec<usize> = (0..=num_tasks).map(|t| t * num_bins / num_tasks).collect();
+    let mut parts: Vec<Vec<&mut [Cmplx]>> = (0..num_tasks).map(|_| Vec::new()).collect();
+    for f in fs.iter_mut() {
+        let mut rest: &mut [Cmplx] = f;
+        for t in 0..num_tasks {
+            let (part, tail) = rest.split_at_mut(bin_bounds[t + 1] - bin_bounds[t]);
+            parts[t].push(part);
+            rest = tail;
+        }
+    }
+    (bin_bounds, parts)
+}
+
+/// Whether the supercell FFT mesh N^s is invariant under the rotation W^s.
+///
+/// This is the integrality of N^s W^s (N^s)^-1, whose elements are
+/// N_i W_ij / N_j: W^s maps the mesh point x^s = (N^s)^-1 m to the point
+/// with N^s W^s (N^s)^-1 m.  It is equivalent to the integrality of
+/// (N^s)^-1 (W^s)^-T N^s, the transpose of its inverse, under which the
+/// classes g mod N^s in reciprocal space go to classes.  phonopy's `BZGrid`
+/// also checks its grid by the integrality of a matrix, but its grid
+/// D^-1 a of points in one reciprocal cell needs D r^-T D^-1, and that
+/// matrix with D = N^s, r = W^s is a different condition here.
+fn rotation_keeps_mesh(mesh: Vec3I, rotation: &MatI) -> bool {
+    (0..3).all(|i| (0..3).all(|j| (mesh[i] * rotation[i][j]) % mesh[j] == 0))
+}
+
+/// Rows sorted by bin, the result of `sort_rows_by_bin`.
+pub struct RowsSortedByBin {
+    /// Rows in the order of (bin, row).
+    pub order: Vec<i64>,
+    /// The rows of bin b are order[bin_offsets[b]..bin_offsets[b + 1]].
+    /// Length is the number of bins plus one.
+    pub bin_offsets: Vec<i64>,
+}
+
+/// Sort the rows g by the bin i_F(g) of g itself (no rotation).
+///
+/// For the shortest representatives, the rows sorted once by this function
+/// are used by `bin_sorted_supercell_fourier_coefficients` for every
+/// operation that keeps the supercell FFT mesh.  The rows of a bin are in
+/// increasing order, so the order does not depend on the number of
+/// threads.
+pub fn sort_rows_by_bin(
+    g: &[Vec3I],
+    p2s_matrix: MatI,
+    fft_mesh: Vec3I,
+) -> Result<RowsSortedByBin, BinSupercellFourierCoefficientsError> {
+    let binning = Binning::new(p2s_matrix, fft_mesh, crate::common::IDENTITY)?;
+    let num_bins = binning.num_bins();
+    if g.len() as u64 > 1 << 32 || num_bins as u64 > 1 << 32 {
+        return Err(BinSupercellFourierCoefficientsError::TooLarge);
+    }
+    let mut keys: Vec<u64> = g
+        .par_iter()
+        .enumerate()
+        .map(|(j, &gj)| (binning.i_f(gj) << 32) | j as u64)
+        .collect();
+    keys.par_sort_unstable();
+    let order: Vec<i64> = keys.par_iter().map(|&k| (k & 0xffff_ffff) as i64).collect();
+    let mut bin_offsets = vec![0i64; num_bins as usize + 1];
+    for &k in &keys {
+        bin_offsets[(k >> 32) as usize + 1] += 1;
+    }
+    for b in 0..num_bins as usize {
+        bin_offsets[b + 1] += bin_offsets[b];
+    }
+    Ok(RowsSortedByBin { order, bin_offsets })
+}
+
+/// Sum the Fourier coefficients by bin into `fs`, with the rows sorted by
+/// bin once (Eq. fold-rotated-presorted of fft-instead-of-nufft-en.tex).
+///
+/// The rows g~' of `g_sorted` are the shortest representatives (the union
+/// G_min of the sets [g]_min) sorted by `sort_rows_by_bin`, and the rows of
+/// bin b are `g_sorted[bin_offsets[b]..bin_offsets[b + 1]]`.  For each row
+/// g~', g~ = (W^s)^T g~' is computed with its class index
+/// s = flat(g~ mod N^s), with g~_1 fastest, and
+/// c[s] * class_weight[s] * exp(-2 pi i g~' . w^s) is added to its bin.
+/// This equals `bin_supercell_fourier_coefficients` with the rows G_min up
+/// to rounding (the terms are added in another order), when (W^s)^-T maps
+/// G_min onto itself.  That holds when the mesh `mesh` is invariant under
+/// `rotation`, which is checked; the possible failure of it from comparing
+/// lengths with a tolerance in the search of G_min is not checked.
+///
+/// `coefficients[c]` and `class_weight` have the length N^s_1 N^s_2 N^s_3,
+/// and `fs[c]` the number of bins `bin_offsets.len() - 1`; every element of
+/// `fs[c]` is written.  `class_weight[s]` is 1 / |[g]_min| of class s.
+///
+/// # Errors
+///
+/// `NonPositiveMesh`, `NonUnimodularRotation`, `MeshNotInvariant` when the
+/// mesh is not invariant under `rotation`, `LengthMismatch` for lengths of
+/// `fs`, `coefficients` or `class_weight`, and `InvalidBinOffsets` when
+/// `bin_offsets` does not go from 0 to `g_sorted.len()` without
+/// decreasing.
+#[allow(clippy::too_many_arguments)]
+pub fn bin_sorted_supercell_fourier_coefficients(
+    fs: &mut [&mut [Cmplx]],
+    coefficients: &[&[Cmplx]],
+    mesh: Vec3I,
+    g_sorted: &[Vec3I],
+    class_weight: &[f64],
+    bin_offsets: &[i64],
+    rotation: MatI,
+    translation: Option<Vec3D>,
+) -> Result<(), BinSupercellFourierCoefficientsError> {
+    use BinSupercellFourierCoefficientsError as E;
+    if mesh.iter().any(|&n| n <= 0) {
+        return Err(E::NonPositiveMesh);
+    }
+    if det_i(&rotation).abs() != 1 {
+        return Err(E::NonUnimodularRotation);
+    }
+    if !rotation_keeps_mesh(mesh, &rotation) {
+        return Err(E::MeshNotInvariant);
+    }
+    let num_coefs = (mesh[0] * mesh[1] * mesh[2]) as usize;
+    if fs.len() != coefficients.len()
+        || coefficients.iter().any(|c| c.len() != num_coefs)
+        || class_weight.len() != num_coefs
+    {
+        return Err(E::LengthMismatch);
+    }
+    if bin_offsets.first() != Some(&0)
+        || bin_offsets.windows(2).any(|w| w[1] < w[0])
+        || bin_offsets[bin_offsets.len() - 1] as usize != g_sorted.len()
+    {
+        return Err(E::InvalidBinOffsets);
+    }
+    let num_bins = bin_offsets.len() - 1;
+    if fs.iter().any(|f| f.len() != num_bins) {
+        return Err(E::LengthMismatch);
+    }
+
+    let w_t = transpose_i(&rotation);
+    let class_index = |g: Vec3I| -> usize {
+        let r = [0, 1, 2].map(|k| g[k].rem_euclid(mesh[k]));
+        ((r[2] * mesh[1] + r[1]) * mesh[0] + r[0]) as usize
+    };
+    let (bin_bounds, parts) = split_bins(fs, num_bins);
+    parts.into_par_iter().enumerate().for_each(|(t, mut outs)| {
+        let mut sums = vec![CMPLX_ZERO; coefficients.len()];
+        for (local, bin) in (bin_bounds[t]..bin_bounds[t + 1]).enumerate() {
+            sums.fill(CMPLX_ZERO);
+            let rows = bin_offsets[bin] as usize..bin_offsets[bin + 1] as usize;
+            for &gp in &g_sorted[rows] {
+                let s = class_index(matvec_ii(&w_t, gp));
+                let weight = class_weight[s];
+                let ph = translation.map(|w| translation_phase(gp, w));
+                for (sum, c) in sums.iter_mut().zip(coefficients) {
+                    let mut v = [c[s][0] * weight, c[s][1] * weight];
+                    if let Some(ph) = ph {
+                        v = cmplx_mul(v, ph);
+                    }
+                    sum[0] += v[0];
+                    sum[1] += v[1];
+                }
             }
             for (out, sum) in outs.iter_mut().zip(&sums) {
                 out[local] = *sum;
@@ -696,5 +868,352 @@ mod tests {
             call([2, 2, 2], IDENTITY, [1, 1, 1], 1, Some(reps(&[0], &[1.0]))),
             Ok(())
         );
+    }
+
+    /// Basis vectors (columns) of a hexagonal lattice, which is not
+    /// orthogonal, so that W^T and W^-1 differ for its rotations.
+    fn hexagonal_lattice() -> [[f64; 3]; 3] {
+        let s = 3.0f64.sqrt() / 2.0;
+        [[1.0, -0.5, 0.0], [0.0, s, 0.0], [0.0, 0.0, 1.6]]
+    }
+
+    /// Basis vectors (columns) of the fcc primitive cell.
+    fn fcc_primitive_lattice() -> [[f64; 3]; 3] {
+        [[0.0, 0.5, 0.5], [0.5, 0.0, 0.5], [0.5, 0.5, 0.0]]
+    }
+
+    /// Integer matrices W with elements -1, 0, 1 and W^T G W = G for the
+    /// metric G = A^T A of the basis A (columns): the rotations of the
+    /// lattice in fractional coordinates.
+    fn lattice_rotations(lattice: [[f64; 3]; 3]) -> Vec<MatI> {
+        let metric =
+            |i: usize, j: usize| (0..3).map(|k| lattice[k][i] * lattice[k][j]).sum::<f64>();
+        let mut rotations = Vec::new();
+        for code in 0..3i64.pow(9) {
+            let mut w = [[0i64; 3]; 3];
+            let mut c = code;
+            for row in w.iter_mut() {
+                for x in row.iter_mut() {
+                    *x = c % 3 - 1;
+                    c /= 3;
+                }
+            }
+            if det_i(&w).abs() != 1 {
+                continue;
+            }
+            let keeps_metric = (0..3).all(|i| {
+                (0..3).all(|j| {
+                    let wgw: f64 = (0..3)
+                        .flat_map(|k| (0..3).map(move |l| (k, l)))
+                        .map(|(k, l)| w[k][i] as f64 * metric(k, l) * w[l][j] as f64)
+                        .sum();
+                    (wgw - metric(i, j)).abs() < 1e-10
+                })
+            });
+            if keeps_metric {
+                rotations.push(w);
+            }
+        }
+        rotations
+    }
+
+    /// The shortest representatives G_min of the classes g mod N^s for the
+    /// lattice A (columns), from `bz_grid_addresses` with the period
+    /// lattice N^s_k b_k, and the weight 1 / |[g]_min| of each class.
+    fn shortest_rows(mesh: Vec3I, lattice: [[f64; 3]; 3]) -> (Vec<Vec3I>, Vec<i64>, Vec<f64>) {
+        let a = lattice;
+        let det = a[0][0] * (a[1][1] * a[2][2] - a[1][2] * a[2][1])
+            - a[0][1] * (a[1][0] * a[2][2] - a[1][2] * a[2][0])
+            + a[0][2] * (a[1][0] * a[2][1] - a[1][1] * a[2][0]);
+        // Reciprocal basis b_k (columns of A^-T), from the cofactors of A.
+        let cof = |i: usize, j: usize| {
+            let (i1, i2) = ((i + 1) % 3, (i + 2) % 3);
+            let (j1, j2) = ((j + 1) % 3, (j + 2) % 3);
+            a[i1][j1] * a[i2][j2] - a[i1][j2] * a[i2][j1]
+        };
+        let mut period = [[0.0; 3]; 3];
+        for i in 0..3 {
+            for k in 0..3 {
+                period[i][k] = cof(i, k) / det * mesh[k] as f64;
+            }
+        }
+        let bz = crate::bzgrid::bz_grid_addresses(mesh, IDENTITY, [0, 0, 0], period, 2).unwrap();
+        let counts: Vec<i64> = bz.bz_map.windows(2).map(|w| w[1] - w[0]).collect();
+        let class_weight = counts.iter().map(|&n| 1.0 / n as f64).collect();
+        (bz.addresses, bz.bzg2grg, class_weight)
+    }
+
+    /// Run `bin_sorted_supercell_fourier_coefficients` on outputs filled
+    /// with NaN.
+    #[allow(clippy::too_many_arguments)]
+    fn run_sorted(
+        coefs: &[Vec<Cmplx>],
+        mesh: Vec3I,
+        g: &[Vec3I],
+        class_weight: &[f64],
+        p2s: MatI,
+        fft_mesh: Vec3I,
+        rotation: MatI,
+        translation: Option<Vec3D>,
+    ) -> Vec<Vec<Cmplx>> {
+        let sorted = sort_rows_by_bin(g, p2s, fft_mesh).unwrap();
+        let g_sorted: Vec<Vec3I> = sorted.order.iter().map(|&j| g[j as usize]).collect();
+        let n = sorted.bin_offsets.len() - 1;
+        let mut fs: Vec<Vec<Cmplx>> = coefs.iter().map(|_| vec![[f64::NAN; 2]; n]).collect();
+        let mut views: Vec<&mut [Cmplx]> = fs.iter_mut().map(|f| f.as_mut_slice()).collect();
+        let cs: Vec<&[Cmplx]> = coefs.iter().map(|c| c.as_slice()).collect();
+        bin_sorted_supercell_fourier_coefficients(
+            &mut views,
+            &cs,
+            mesh,
+            &g_sorted,
+            class_weight,
+            &sorted.bin_offsets,
+            rotation,
+            translation,
+        )
+        .unwrap();
+        fs
+    }
+
+    #[test]
+    fn lattice_rotations_of_test_lattices() {
+        assert_eq!(lattice_rotations(hexagonal_lattice()).len(), 24);
+        assert_eq!(lattice_rotations(fcc_primitive_lattice()).len(), 48);
+    }
+
+    #[test]
+    fn rotation_keeps_mesh_is_integrality() {
+        let six_fold = [[1, -1, 0], [1, 0, 0], [0, 0, 1]];
+        assert!(rotation_keeps_mesh([6, 6, 4], &six_fold));
+        assert!(!rotation_keeps_mesh([6, 5, 4], &six_fold));
+        let swap13 = [[0, 0, 1], [0, 1, 0], [1, 0, 0]];
+        assert!(!rotation_keeps_mesh([4, 4, 6], &swap13));
+        assert!(rotation_keeps_mesh([4, 4, 6], &IDENTITY));
+        for w in lattice_rotations(fcc_primitive_lattice()) {
+            assert!(rotation_keeps_mesh([5, 5, 5], &w));
+        }
+        // N W N^-1 integral for W, and (N^-1 W^-T N) integral for W^-1 = W^T
+        // of an orthogonal W, checked against the elements directly.
+        let mesh = [2, 4, 4];
+        for w in lattice_rotations([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]) {
+            let integral = (0..3).all(|i| (0..3).all(|j| (mesh[i] * w[i][j]) % mesh[j] == 0));
+            assert_eq!(rotation_keeps_mesh(mesh, &w), integral);
+        }
+    }
+
+    #[test]
+    fn sort_rows_by_bin_partitions_rows() {
+        let mesh = [6, 6, 4];
+        let (g, _, _) = shortest_rows(mesh, hexagonal_lattice());
+        assert!(g.len() > (mesh[0] * mesh[1] * mesh[2]) as usize);
+        let p2s = [[2, 0, 0], [0, 2, 0], [0, 0, 1]];
+        let fft_mesh = [2, 3, 2];
+        let sorted = sort_rows_by_bin(&g, p2s, fft_mesh).unwrap();
+        let binning = Binning::new(p2s, fft_mesh, IDENTITY).unwrap();
+        assert_eq!(sorted.bin_offsets.len() as i64, binning.num_bins() + 1);
+        assert_eq!(sorted.bin_offsets[0], 0);
+        assert_eq!(*sorted.bin_offsets.last().unwrap() as usize, g.len());
+        let mut seen = vec![false; g.len()];
+        for b in 0..sorted.bin_offsets.len() - 1 {
+            let rows =
+                &sorted.order[sorted.bin_offsets[b] as usize..sorted.bin_offsets[b + 1] as usize];
+            assert!(rows.windows(2).all(|w| w[0] < w[1]));
+            for &j in rows {
+                assert_eq!(binning.i_f(g[j as usize]) as usize, b);
+                assert!(!seen[j as usize]);
+                seen[j as usize] = true;
+            }
+        }
+        assert!(seen.iter().all(|&x| x));
+    }
+
+    /// Eq. fold-rotated-presorted equals Eq. fold-rotated-shortest (the
+    /// present kernel with the rows G_min) for every rotation of the
+    /// lattice, with a mesh invariant under all of them.
+    #[test]
+    fn sorted_matches_present_kernel() {
+        for (lattice, mesh, p2s, fft_mesh) in [
+            (
+                hexagonal_lattice(),
+                [6, 6, 4],
+                [[2, 0, 0], [0, 2, 0], [0, 0, 1]],
+                [2, 3, 2],
+            ),
+            (fcc_primitive_lattice(), [5, 5, 5], p2s_fcc(), [2, 2, 3]),
+        ] {
+            let (g, source, class_weight) = shortest_rows(mesh, lattice);
+            let weight: Vec<f64> = source.iter().map(|&s| class_weight[s as usize]).collect();
+            let num_coefs = (mesh[0] * mesh[1] * mesh[2]) as usize;
+            let coefs = vec![coefficients(num_coefs, 6), coefficients(num_coefs, 7)];
+            for rotation in lattice_rotations(lattice) {
+                for translation in [None, Some([0.1, -0.3, 0.7])] {
+                    let present = run(
+                        &coefs,
+                        mesh,
+                        p2s,
+                        fft_mesh,
+                        rotation,
+                        translation,
+                        Some(Representatives {
+                            g: &g,
+                            source: &source,
+                            weight: &weight,
+                        }),
+                    );
+                    let sorted = run_sorted(
+                        &coefs,
+                        mesh,
+                        &g,
+                        &class_weight,
+                        p2s,
+                        fft_mesh,
+                        rotation,
+                        translation,
+                    );
+                    for (f, r) in sorted.iter().zip(&present) {
+                        let scale = r
+                            .iter()
+                            .map(|v| v[0].abs().max(v[1].abs()))
+                            .fold(0.0, f64::max);
+                        assert!(scale > 0.1);
+                        for (a, b) in f.iter().zip(r) {
+                            assert!((a[0] - b[0]).abs() < 1e-13 * scale);
+                            assert!((a[1] - b[1]).abs() < 1e-13 * scale);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Every element of the outputs is written, also the bins without rows.
+    #[test]
+    fn sorted_writes_every_bin() {
+        let mesh = [4, 4, 4];
+        let (g, _, class_weight) = shortest_rows(mesh, fcc_primitive_lattice());
+        let p2s = p2s_fcc();
+        let fft_mesh = [3, 3, 3];
+        let sorted = sort_rows_by_bin(&g, p2s, fft_mesh).unwrap();
+        let num_empty = sorted
+            .bin_offsets
+            .windows(2)
+            .filter(|w| w[0] == w[1])
+            .count();
+        assert!(num_empty > 0);
+        let coefs = vec![coefficients(64, 8)];
+        let fs = run_sorted(
+            &coefs,
+            mesh,
+            &g,
+            &class_weight,
+            p2s,
+            fft_mesh,
+            three_fold(),
+            Some([0.25, 0.5, 0.125]),
+        );
+        assert!(fs[0].iter().all(|v| v[0].is_finite() && v[1].is_finite()));
+        for (b, w) in sorted.bin_offsets.windows(2).enumerate() {
+            if w[0] == w[1] {
+                assert_eq!(fs[0][b], [0.0, 0.0]);
+            }
+        }
+    }
+
+    #[test]
+    fn sorted_independent_of_number_of_threads() {
+        let mesh = [6, 6, 4];
+        let (g, _, class_weight) = shortest_rows(mesh, hexagonal_lattice());
+        let coefs = vec![coefficients(144, 9)];
+        let six_fold = [[1, -1, 0], [1, 0, 0], [0, 0, 1]];
+        let results: Vec<Vec<Vec<Cmplx>>> = [1, 3, 8]
+            .iter()
+            .map(|&n| {
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(n)
+                    .build()
+                    .unwrap()
+                    .install(|| {
+                        run_sorted(
+                            &coefs,
+                            mesh,
+                            &g,
+                            &class_weight,
+                            [[2, 0, 0], [0, 2, 0], [0, 0, 1]],
+                            [2, 3, 2],
+                            six_fold,
+                            Some([0.3, 0.1, 0.2]),
+                        )
+                    })
+            })
+            .collect();
+        assert_eq!(results[0], results[1]);
+        assert_eq!(results[0], results[2]);
+    }
+
+    #[test]
+    fn sorted_errors() {
+        use BinSupercellFourierCoefficientsError as E;
+        let mesh = [4, 4, 6];
+        let c = coefficients(96, 10);
+        let weight = vec![1.0; 96];
+        let g = [[0, 0, 0], [1, 0, 0]];
+        let call = |mesh: Vec3I,
+                    class_weight: &[f64],
+                    bin_offsets: &[i64],
+                    out_len: usize,
+                    rotation: MatI| {
+            let mut f = vec![[0.0; 2]; out_len];
+            bin_sorted_supercell_fourier_coefficients(
+                &mut [&mut f],
+                &[&c],
+                mesh,
+                &g,
+                class_weight,
+                bin_offsets,
+                rotation,
+                None,
+            )
+        };
+        assert_eq!(call(mesh, &weight, &[0, 1, 2], 2, IDENTITY), Ok(()));
+        let swap13 = [[0, 0, 1], [0, 1, 0], [1, 0, 0]];
+        assert_eq!(
+            call(mesh, &weight, &[0, 1, 2], 2, swap13),
+            Err(E::MeshNotInvariant)
+        );
+        assert_eq!(
+            call(
+                mesh,
+                &weight,
+                &[0, 1, 2],
+                2,
+                [[2, 0, 0], [0, 1, 0], [0, 0, 1]]
+            ),
+            Err(E::NonUnimodularRotation)
+        );
+        assert_eq!(
+            call([4, 0, 6], &weight, &[0, 1, 2], 2, IDENTITY),
+            Err(E::NonPositiveMesh)
+        );
+        assert_eq!(
+            call(mesh, &weight[1..], &[0, 1, 2], 2, IDENTITY),
+            Err(E::LengthMismatch)
+        );
+        assert_eq!(
+            call(mesh, &weight, &[0, 1, 2], 3, IDENTITY),
+            Err(E::LengthMismatch)
+        );
+        for offsets in [&[][..], &[1, 1, 2], &[0, 2, 1], &[0, 1, 1]] {
+            assert_eq!(
+                call(
+                    mesh,
+                    &weight,
+                    offsets,
+                    offsets.len().saturating_sub(1),
+                    IDENTITY
+                ),
+                Err(E::InvalidBinOffsets)
+            );
+        }
     }
 }
