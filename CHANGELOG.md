@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-11-04
+
 ### Added
 - `multiply_by_phase`, `rotate_spin_components`,
   `apply_time_reversal_to_spin_components`, `add_to_normal_equation_rhs`
@@ -125,7 +127,8 @@ Initial public release.  Provides the Rust kernel set used by
 `abi3-py310` wheels for Linux x86_64 / aarch64, macOS x86_64 /
 arm64, and Windows x86_64.
 
-[Unreleased]: https://github.com/phonopy/phonors/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/phonopy/phonors/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/phonopy/phonors/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/phonopy/phonors/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/phonopy/phonors/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/phonopy/phonors/compare/v0.4.0...v0.5.0
