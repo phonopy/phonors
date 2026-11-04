@@ -2,18 +2,20 @@
 //!
 //! Kernels of the native evaluation of a Fourier series of the supercell on
 //! the grid of the primitive cell in phelel (`FourierSeriesOnGrid.get_phi`).
-//! The series has the coefficients c(g) at the integer coordinates g of the
-//! reciprocal lattice vectors of the supercell (column vectors).  c(g) is
-//! periodic with the supercell FFT mesh N^s, c(g + N^s t) = c(g), and is
-//! stored at the index
+//! The series has the coefficients c(g) at the g-points: the points g of
+//! the reciprocal lattice of the supercell, given by integer coordinates in
+//! the basis of the reciprocal lattice of the supercell (column vectors).
+//! c(g) is periodic with the supercell FFT mesh N^s, c(g + N^s t) = c(g),
+//! and is stored at the index
 //!
 //! ```text
 //! s(g) = ((g_3 mod N^s_3) N^s_2 + (g_2 mod N^s_2)) N^s_1 + (g_1 mod N^s_1)
 //! ```
 //!
 //! of the flattened coefficient array, called the source of g.  The series
-//! is summed over representatives g~, one or more for each source; the
-//! representatives with the same source share its coefficient with the
+//! is summed over the selected g-points g~: for each source, one or more
+//! g-points with this source, selected by a rule such as the shortest ones.
+//! The selected g-points with the same source share its coefficient with the
 //! weight 1 / (their number).
 //!
 //! For a space-group operation acting as x^s -> W^s x^s + w^s in the
@@ -38,22 +40,24 @@
 //!
 //! and the term of g~ is added to F[i_F].
 //!
-//! The binning has two steps.  `sort_rows_by_bin` returns g~' of all
-//! representatives sorted by bin, and
+//! The binning has two steps.  `sort_g_points_by_bin` returns g~' of all
+//! selected g-points sorted by bin, and
 //! `bin_sorted_supercell_fourier_coefficients` adds, for each g~' in this
 //! order, the coefficient and the weight of g~ = (W^s)^T g~' with the phase
-//! of g~'.  When (W^s)^-T maps the representatives onto themselves
-//! (`rows_closed_under_rotation`), the g~' are the representatives
-//! themselves, so the representatives sorted once with the identity can be
+//! of g~'.  When (W^s)^-T maps the selected g-points onto themselves
+//! (`g_points_closed_under_rotation`), the g~' are the selected g-points
+//! themselves, so the selected g-points sorted once with the identity can be
 //! passed for this rotation: their bins do not depend on the operation.
 //!
-//! The sums are deterministic: the rows are sorted by (i_F, row) and each
-//! bin is summed in this order for any number of threads.
+//! The sums are deterministic: the g-points are sorted by (i_F, index of
+//! g~ in the input) and each bin is summed in this order for any number of
+//! threads.
 
 use rayon::prelude::*;
 
 use crate::common::{
-    cmplx_mul, det_i, matvec_ii, transpose_i, Cmplx, MatI, Vec3D, Vec3I, CMPLX_ZERO, IDENTITY,
+    cmplx_add, cmplx_mul, cmplx_scale, det_i, matvec_ii, transpose_i, Cmplx, MatI, Vec3D, Vec3I,
+    CMPLX_ZERO, IDENTITY,
 };
 use crate::snf3x3::snf3x3;
 
@@ -67,12 +71,12 @@ pub enum FourierBinsError {
     SnfNotConverged,
     /// A component of a mesh is not positive.
     NonPositiveMesh,
-    /// The number of rows or of bins exceeds 2^32.
+    /// The number of g-points or of bins exceeds 2^32.
     TooLarge,
     /// The lengths of the inputs or outputs do not agree.
     LengthMismatch,
     /// bin_offsets or source_offsets does not go from 0 to the number of
-    /// rows without decreasing, or the rows are not in the order of
+    /// g-points without decreasing, or the g-points are not in the order of
     /// source_offsets.
     InvalidOffsets,
 }
@@ -172,7 +176,7 @@ fn source_of(g: Vec3I, supercell_mesh: Vec3I) -> usize {
     ((r[2] * supercell_mesh[1] + r[1]) * supercell_mesh[0] + r[0]) as usize
 }
 
-/// exp(-2 pi i g' . w^s) for the integer vector g' and the translation w^s.
+/// exp(-2 pi i g' . w^s) for the g-point g' and the translation w^s.
 fn translation_phase(gp: Vec3I, w: Vec3D) -> Cmplx {
     let two_pi = 2.0 * std::f64::consts::PI;
     let arg = (-two_pi * gp[0] as f64) * w[0]
@@ -211,39 +215,40 @@ fn split_bins<'a>(
     (bin_bounds, parts)
 }
 
-/// Rotated representatives sorted by bin, the result of `sort_rows_by_bin`.
-pub struct RowsSortedByBin {
-    /// g~' = (W^s)^-T g~ of all representatives g~ in the order of
-    /// (bin of g~', row of g~).
+/// The rotated selected g-points sorted by bin, from `sort_g_points_by_bin`.
+pub struct GPointsSortedByBin {
+    /// g~' = (W^s)^-T g~ of all selected g-points g~ in the order of
+    /// (bin of g~', index of g~ in g).
     pub g_sorted: Vec<Vec3I>,
     /// The g~' of bin b are g_sorted[bin_offsets[b]..bin_offsets[b + 1]].
     /// Length is the number of bins N_c N^p_1 N^p_2 N^p_3 plus one.
     pub bin_offsets: Vec<i64>,
 }
 
-/// Sort g~' = (W^s)^-T g~ of the representatives g by the bin of g~'.
+/// Sort g~' = (W^s)^-T g~ of the selected g-points g by the bin of g~'.
 ///
-/// The rows of a bin keep the order of g, so the result does not depend on
-/// the number of threads.  With the identity as `rotation`, the
-/// representatives themselves are sorted, as used for every rotation under
-/// which they are closed (`rows_closed_under_rotation`).
+/// The g-points of a bin keep the order of g, so the result does not depend
+/// on the number of threads.  With the identity as `rotation`, the selected
+/// g-points themselves are sorted, as used for every rotation under which
+/// they are closed (`g_points_closed_under_rotation`).
 ///
 /// # Errors
 ///
 /// `SingularP2sMatrix`, `NonPositiveMesh` for `fft_mesh`,
 /// `NonUnimodularRotation`, `SnfNotConverged`, and `TooLarge` for more than
-/// 2^32 rows or bins.
-pub fn sort_rows_by_bin(
+/// 2^32 g-points or bins.
+pub fn sort_g_points_by_bin(
     g: &[Vec3I],
     p2s_matrix: MatI,
     fft_mesh: Vec3I,
     rotation: MatI,
-) -> Result<RowsSortedByBin, FourierBinsError> {
+) -> Result<GPointsSortedByBin, FourierBinsError> {
     let binning = Binning::new(p2s_matrix, fft_mesh, rotation)?;
     let num_bins = binning.num_bins();
     if g.len() as u64 > 1 << 32 || num_bins as u64 > 1 << 32 {
         return Err(FourierBinsError::TooLarge);
     }
+    // key: i_F of g~' in the upper 32 bits, index j of g~ in the lower 32 bits.
     let mut keys: Vec<u64> = g
         .par_iter()
         .enumerate()
@@ -261,7 +266,7 @@ pub fn sort_rows_by_bin(
     for b in 0..num_bins as usize {
         bin_offsets[b + 1] += bin_offsets[b];
     }
-    Ok(RowsSortedByBin {
+    Ok(GPointsSortedByBin {
         g_sorted,
         bin_offsets,
     })
@@ -279,16 +284,16 @@ pub fn sort_rows_by_bin(
 /// ```
 ///
 /// This is the binned series of the rotated function when `g_sorted` are
-/// the rotated representatives (W^s)^-T g~ sorted by bin
-/// (`sort_rows_by_bin` with `rotation`), and also when they are the
-/// representatives sorted once with the identity and the representatives
-/// are closed under (W^s)^-T (`rows_closed_under_rotation`).  The terms are
-/// then the same, added in another order.
+/// the rotated selected g-points (W^s)^-T g~ sorted by bin
+/// (`sort_g_points_by_bin` with `rotation`), and also when they are the
+/// selected g-points sorted once with the identity and these are closed
+/// under (W^s)^-T (`g_points_closed_under_rotation`).  The terms are then
+/// the same, added in another order.
 ///
 /// `coefficients[c]` and `source_weight` have the length
 /// N^s_1 N^s_2 N^s_3 of the supercell FFT mesh, and `fs[c]` the number of
 /// bins `bin_offsets.len() - 1`; every element of `fs[c]` is written.
-/// `source_weight[s]` is 1 / (number of representatives with source s).
+/// `source_weight[s]` is 1 / (number of selected g-points with source s).
 ///
 /// # Errors
 ///
@@ -305,7 +310,7 @@ pub fn bin_sorted_supercell_fourier_coefficients(
     source_weight: &[f64],
     bin_offsets: &[i64],
     rotation: MatI,
-    translation: Option<Vec3D>,
+    translation: Vec3D,
 ) -> Result<(), FourierBinsError> {
     use FourierBinsError as E;
     if supercell_mesh.iter().any(|&n| n <= 0) {
@@ -335,18 +340,14 @@ pub fn bin_sorted_supercell_fourier_coefficients(
         let mut sums = vec![CMPLX_ZERO; coefficients.len()];
         for (local, bin) in (bin_bounds[t]..bin_bounds[t + 1]).enumerate() {
             sums.fill(CMPLX_ZERO);
-            let rows = bin_offsets[bin] as usize..bin_offsets[bin + 1] as usize;
-            for &gp in &g_sorted[rows] {
+            let in_bin = bin_offsets[bin] as usize..bin_offsets[bin + 1] as usize;
+            for &gp in &g_sorted[in_bin] {
                 let s = source_of(matvec_ii(&w_t, gp), supercell_mesh);
                 let weight = source_weight[s];
-                let phase = translation.map(|w| translation_phase(gp, w));
+                let phase = translation_phase(gp, translation);
                 for (sum, c) in sums.iter_mut().zip(coefficients) {
-                    let mut v = [c[s][0] * weight, c[s][1] * weight];
-                    if let Some(phase) = phase {
-                        v = cmplx_mul(v, phase);
-                    }
-                    sum[0] += v[0];
-                    sum[1] += v[1];
+                    let v = cmplx_mul(cmplx_scale(weight, c[s]), phase);
+                    *sum = cmplx_add(*sum, v);
                 }
             }
             for (out, sum) in outs.iter_mut().zip(&sums) {
@@ -357,14 +358,14 @@ pub fn bin_sorted_supercell_fourier_coefficients(
     Ok(())
 }
 
-/// Whether (W^s)^-T maps the representatives `g` onto themselves.
+/// Whether (W^s)^-T maps the selected g-points `g` onto themselves.
 ///
-/// `g` is in the order of the source: the representatives with source s
-/// are `g[source_offsets[s]..source_offsets[s + 1]]`.  For each
-/// representative g~, g~' = (W^s)^-T g~ has to be one of the
-/// representatives with the source of g~'.  The set is finite and the map
-/// is one-to-one, so this is (W^s)^-T G = G for the set G of the
-/// representatives.  The check stops at the first g~' that is not found.
+/// `g` is in the order of the source: the selected g-points with source s
+/// are `g[source_offsets[s]..source_offsets[s + 1]]`.  For each selected
+/// g-point g~, g~' = (W^s)^-T g~ has to be one of the selected g-points with
+/// the source of g~'.  The set is finite and the map is one-to-one, so this
+/// is (W^s)^-T G = G for the set G of the selected g-points.  The check
+/// stops at the first g~' that is not found.
 ///
 /// # Errors
 ///
@@ -372,7 +373,7 @@ pub fn bin_sorted_supercell_fourier_coefficients(
 /// `source_offsets` does not have the length N^s_1 N^s_2 N^s_3 + 1, and
 /// `InvalidOffsets` when it does not go from 0 to `g.len()` without
 /// decreasing or `g` is not in its order.
-pub fn rows_closed_under_rotation(
+pub fn g_points_closed_under_rotation(
     g: &[Vec3I],
     source_offsets: &[i64],
     supercell_mesh: Vec3I,
@@ -514,19 +515,19 @@ mod tests {
         rotations
     }
 
-    /// Representatives with their sources, source_offsets and source_weight.
-    struct Representatives {
+    /// Selected g-points with their sources, source_offsets and source_weight.
+    struct SelectedGPoints {
         g: Vec<Vec3I>,
         source: Vec<usize>,
         source_offsets: Vec<i64>,
         source_weight: Vec<f64>,
     }
 
-    /// The box: one representative per source, in the order of the source.
-    fn box_representatives(mesh: Vec3I) -> Representatives {
+    /// The box: one selected g-point per source, in the order of the source.
+    fn box_g_points(mesh: Vec3I) -> SelectedGPoints {
         let g = box_g(mesh);
         let n = g.len();
-        Representatives {
+        SelectedGPoints {
             source: (0..n).collect(),
             source_offsets: (0..=n as i64).collect(),
             source_weight: vec![1.0; n],
@@ -534,9 +535,9 @@ mod tests {
         }
     }
 
-    /// The shortest representatives for the lattice A (columns), from
+    /// The shortest selected g-points for the lattice A (columns), from
     /// `bz_grid_addresses` with the period lattice N^s_k b_k.
-    fn shortest_representatives(mesh: Vec3I, lattice: [[f64; 3]; 3]) -> Representatives {
+    fn shortest_g_points(mesh: Vec3I, lattice: [[f64; 3]; 3]) -> SelectedGPoints {
         let a = lattice;
         let det = a[0][0] * (a[1][1] * a[2][2] - a[1][2] * a[2][1])
             - a[0][1] * (a[1][0] * a[2][2] - a[1][2] * a[2][0])
@@ -560,7 +561,7 @@ mod tests {
             .windows(2)
             .map(|w| 1.0 / (w[1] - w[0]) as f64)
             .collect();
-        Representatives {
+        SelectedGPoints {
             g: bz.addresses,
             source,
             source_offsets: bz.bz_map,
@@ -568,33 +569,31 @@ mod tests {
         }
     }
 
-    /// The binned series summed term by term in the order of the
-    /// representatives, without sorting: the term of g~ is added to the bin
-    /// of g~' = (W^s)^-T g~.
+    /// The binned series summed term by term in the order of the selected
+    /// g-points, without sorting: the term of g~ is added to the bin of
+    /// g~' = (W^s)^-T g~.
     fn reference(
-        reps: &Representatives,
+        selected: &SelectedGPoints,
         coefs: &[Cmplx],
         p2s: MatI,
         fft_mesh: Vec3I,
         rotation: MatI,
-        translation: Option<Vec3D>,
+        translation: Vec3D,
     ) -> Vec<Cmplx> {
         let binning = Binning::new(p2s, fft_mesh, rotation).unwrap();
         let mut f = vec![[0.0; 2]; binning.num_bins() as usize];
-        for (j, &gj) in reps.g.iter().enumerate() {
+        for (j, &gj) in selected.g.iter().enumerate() {
             let gp = binning.rotate(gj);
-            let s = reps.source[j];
+            let s = selected.source[j];
             let c = coefs[s];
-            let weight = reps.source_weight[s];
-            let mut v = [c[0] * weight, c[1] * weight];
-            if let Some(w) = translation {
-                let two_pi = 2.0 * std::f64::consts::PI;
-                let arg = (-two_pi * gp[0] as f64) * w[0]
-                    + (-two_pi * gp[1] as f64) * w[1]
-                    + (-two_pi * gp[2] as f64) * w[2];
-                let (sin, cos) = arg.sin_cos();
-                v = cmplx_mul(v, [cos, sin]);
-            }
+            let weight = selected.source_weight[s];
+            let w = translation;
+            let two_pi = 2.0 * std::f64::consts::PI;
+            let arg = (-two_pi * gp[0] as f64) * w[0]
+                + (-two_pi * gp[1] as f64) * w[1]
+                + (-two_pi * gp[2] as f64) * w[2];
+            let (sin, cos) = arg.sin_cos();
+            let v = cmplx_mul([c[0] * weight, c[1] * weight], [cos, sin]);
             let i = binning.i_f(gp) as usize;
             f[i][0] += v[0];
             f[i][1] += v[1];
@@ -608,14 +607,14 @@ mod tests {
     fn run(
         coefs: &[Vec<Cmplx>],
         mesh: Vec3I,
-        reps: &Representatives,
+        selected: &SelectedGPoints,
         p2s: MatI,
         fft_mesh: Vec3I,
         sort_rotation: MatI,
         rotation: MatI,
-        translation: Option<Vec3D>,
+        translation: Vec3D,
     ) -> Vec<Vec<Cmplx>> {
-        let sorted = sort_rows_by_bin(&reps.g, p2s, fft_mesh, sort_rotation).unwrap();
+        let sorted = sort_g_points_by_bin(&selected.g, p2s, fft_mesh, sort_rotation).unwrap();
         let n = sorted.bin_offsets.len() - 1;
         let mut fs: Vec<Vec<Cmplx>> = coefs.iter().map(|_| vec![[f64::NAN; 2]; n]).collect();
         let mut views: Vec<&mut [Cmplx]> = fs.iter_mut().map(|f| f.as_mut_slice()).collect();
@@ -625,7 +624,7 @@ mod tests {
             &cs,
             mesh,
             &sorted.g_sorted,
-            &reps.source_weight,
+            &selected.source_weight,
             &sorted.bin_offsets,
             rotation,
             translation,
@@ -634,16 +633,16 @@ mod tests {
         fs
     }
 
-    /// Closure checked with a hash set of all representatives.
-    fn closed_by_set(reps: &Representatives, rotation: MatI) -> bool {
+    /// Closure checked with a hash set of all selected g-points.
+    fn closed_by_set(selected: &SelectedGPoints, rotation: MatI) -> bool {
         let binning = Binning::new(IDENTITY, [1, 1, 1], rotation).unwrap();
-        let set: HashSet<Vec3I> = reps.g.iter().copied().collect();
-        reps.g.iter().all(|&g| set.contains(&binning.rotate(g)))
+        let set: HashSet<Vec3I> = selected.g.iter().copied().collect();
+        selected.g.iter().all(|&g| set.contains(&binning.rotate(g)))
     }
 
     /// Lattices, meshes and supercell matrices of the tests.  Some meshes are
-    /// not kept by some rotations of the lattice, so that the representatives
-    /// are not closed under them.
+    /// not kept by some rotations of the lattice, so that the selected
+    /// g-points are not closed under them.
     fn cases() -> Vec<([[f64; 3]; 3], Vec3I, MatI, Vec3I)> {
         vec![
             (
@@ -746,35 +745,39 @@ mod tests {
         assert_eq!(lattice_rotations(fcc_primitive_lattice()).len(), 48);
     }
 
-    /// g_sorted are the rotated representatives, each in its bin, and the
-    /// rows of a bin keep the order of the representatives.
+    /// g_sorted are the rotated selected g-points, each in its bin, and the
+    /// g-points of a bin keep the order of the selected g-points.
     #[test]
-    fn sort_rows_by_bin_sorts_rotated_rows() {
+    fn sort_g_points_by_bin_sorts_rotated_g_points() {
         let mesh = [6, 6, 4];
-        let reps = shortest_representatives(mesh, hexagonal_lattice());
-        assert!(reps.g.len() > (mesh[0] * mesh[1] * mesh[2]) as usize);
+        let selected = shortest_g_points(mesh, hexagonal_lattice());
+        assert!(selected.g.len() > (mesh[0] * mesh[1] * mesh[2]) as usize);
         let p2s = [[2, 0, 0], [0, 2, 0], [0, 0, 1]];
         let fft_mesh = [2, 3, 2];
-        let row_of: HashMap<Vec3I, usize> =
-            reps.g.iter().enumerate().map(|(j, &g)| (g, j)).collect();
+        let index_of: HashMap<Vec3I, usize> = selected
+            .g
+            .iter()
+            .enumerate()
+            .map(|(j, &g)| (g, j))
+            .collect();
         for rotation in [IDENTITY, six_fold()] {
-            let sorted = sort_rows_by_bin(&reps.g, p2s, fft_mesh, rotation).unwrap();
+            let sorted = sort_g_points_by_bin(&selected.g, p2s, fft_mesh, rotation).unwrap();
             let binning = Binning::new(p2s, fft_mesh, rotation).unwrap();
             assert_eq!(sorted.bin_offsets.len() as i64, binning.num_bins() + 1);
-            assert!(offsets_are_valid(&sorted.bin_offsets, reps.g.len()));
+            assert!(offsets_are_valid(&sorted.bin_offsets, selected.g.len()));
             let w_t = transpose_i(&rotation);
-            let mut seen = vec![false; reps.g.len()];
+            let mut seen = vec![false; selected.g.len()];
             for b in 0..sorted.bin_offsets.len() - 1 {
                 let range = sorted.bin_offsets[b] as usize..sorted.bin_offsets[b + 1] as usize;
-                let rows: Vec<usize> = sorted.g_sorted[range]
+                let indices: Vec<usize> = sorted.g_sorted[range]
                     .iter()
                     .map(|&gp| {
                         assert_eq!(binning.i_f(gp) as usize, b);
-                        row_of[&matvec_ii(&w_t, gp)]
+                        index_of[&matvec_ii(&w_t, gp)]
                     })
                     .collect();
-                assert!(rows.windows(2).all(|w| w[0] < w[1]));
-                for j in rows {
+                assert!(indices.windows(2).all(|w| w[0] < w[1]));
+                for j in indices {
                     assert!(!seen[j]);
                     seen[j] = true;
                 }
@@ -783,30 +786,27 @@ mod tests {
         }
     }
 
-    /// Sorting the rotated representatives for each rotation gives the
-    /// term-by-term sum exactly, for box and shortest representatives and
+    /// Sorting the rotated selected g-points for each rotation gives the
+    /// term-by-term sum exactly, for box and shortest selected g-points and
     /// for every rotation of the lattice, also those under which the
-    /// representatives are not closed.  The terms are added in the same
+    /// selected g-points are not closed.  The terms are added in the same
     /// order, so the results are equal bit by bit.
     #[test]
-    fn rows_sorted_for_each_rotation_equal_reference() {
+    fn g_points_sorted_for_each_rotation_equal_reference() {
         let mut num_not_closed = 0;
         for (lattice, mesh, p2s, fft_mesh) in cases() {
             let num_coefs = (mesh[0] * mesh[1] * mesh[2]) as usize;
             let coefs = vec![coefficients(num_coefs, 1), coefficients(num_coefs, 2)];
-            for reps in [
-                box_representatives(mesh),
-                shortest_representatives(mesh, lattice),
-            ] {
+            for selected in [box_g_points(mesh), shortest_g_points(mesh, lattice)] {
                 for rotation in lattice_rotations(lattice) {
-                    if !closed_by_set(&reps, rotation) {
+                    if !closed_by_set(&selected, rotation) {
                         num_not_closed += 1;
                     }
-                    for translation in [None, Some([0.1, -0.3, 0.7])] {
+                    for translation in [[0.0; 3], [0.1, -0.3, 0.7]] {
                         let fs = run(
                             &coefs,
                             mesh,
-                            &reps,
+                            &selected,
                             p2s,
                             fft_mesh,
                             rotation,
@@ -814,7 +814,7 @@ mod tests {
                             translation,
                         );
                         for (c, f) in coefs.iter().zip(&fs) {
-                            let r = reference(&reps, c, p2s, fft_mesh, rotation, translation);
+                            let r = reference(&selected, c, p2s, fft_mesh, rotation, translation);
                             assert_eq!(f, &r);
                         }
                     }
@@ -824,36 +824,33 @@ mod tests {
         assert!(num_not_closed > 0);
     }
 
-    /// For a rotation under which the representatives are closed, the
-    /// representatives sorted once with the identity give the term-by-term
+    /// For a rotation under which the selected g-points are closed, the
+    /// selected g-points sorted once with the identity give the term-by-term
     /// sum up to rounding (the terms are added in another order).
     #[test]
-    fn rows_sorted_once_equal_reference_when_closed() {
+    fn g_points_sorted_once_equal_reference_when_closed() {
         let mut num_closed = 0;
         for (lattice, mesh, p2s, fft_mesh) in cases() {
             let num_coefs = (mesh[0] * mesh[1] * mesh[2]) as usize;
             let coefs = vec![coefficients(num_coefs, 3)];
-            for reps in [
-                box_representatives(mesh),
-                shortest_representatives(mesh, lattice),
-            ] {
+            for selected in [box_g_points(mesh), shortest_g_points(mesh, lattice)] {
                 for rotation in lattice_rotations(lattice) {
-                    if !closed_by_set(&reps, rotation) {
+                    if !closed_by_set(&selected, rotation) {
                         continue;
                     }
                     num_closed += 1;
-                    let translation = Some([0.1, -0.3, 0.7]);
+                    let translation = [0.1, -0.3, 0.7];
                     let fs = run(
                         &coefs,
                         mesh,
-                        &reps,
+                        &selected,
                         p2s,
                         fft_mesh,
                         IDENTITY,
                         rotation,
                         translation,
                     );
-                    let r = reference(&reps, &coefs[0], p2s, fft_mesh, rotation, translation);
+                    let r = reference(&selected, &coefs[0], p2s, fft_mesh, rotation, translation);
                     let scale = r
                         .iter()
                         .map(|v| v[0].abs().max(v[1].abs()))
@@ -869,49 +866,51 @@ mod tests {
         assert!(num_closed > 0);
     }
 
-    /// rows_closed_under_rotation agrees with the check by a hash set.  The
+    /// g_points_closed_under_rotation agrees with the check by a hash set.  The
     /// mesh (4, 4, 6) with the axes 1 and 3 exchanged: (0, 0, 3) is a
-    /// shortest representative and (3, 0, 0) is not, so it is not closed.
+    /// shortest selected g-point and (3, 0, 0) is not, so it is not closed.
     #[test]
-    fn rows_closed_under_rotation_equals_set_check() {
+    fn g_points_closed_under_rotation_equals_set_check() {
         let mut counts = [0usize; 2];
         for (lattice, mesh, _, _) in cases() {
-            for reps in [
-                box_representatives(mesh),
-                shortest_representatives(mesh, lattice),
-            ] {
+            for selected in [box_g_points(mesh), shortest_g_points(mesh, lattice)] {
                 for rotation in lattice_rotations(lattice) {
-                    let closed =
-                        rows_closed_under_rotation(&reps.g, &reps.source_offsets, mesh, rotation)
-                            .unwrap();
-                    assert_eq!(closed, closed_by_set(&reps, rotation));
+                    let closed = g_points_closed_under_rotation(
+                        &selected.g,
+                        &selected.source_offsets,
+                        mesh,
+                        rotation,
+                    )
+                    .unwrap();
+                    assert_eq!(closed, closed_by_set(&selected, rotation));
                     counts[closed as usize] += 1;
                 }
             }
         }
         assert!(counts[0] > 0 && counts[1] > 0);
         let mesh = [4, 4, 6];
-        let reps = shortest_representatives(mesh, cubic_lattice());
-        assert!(reps.g.contains(&[0, 0, 3]) && !reps.g.contains(&[3, 0, 0]));
+        let selected = shortest_g_points(mesh, cubic_lattice());
+        assert!(selected.g.contains(&[0, 0, 3]) && !selected.g.contains(&[3, 0, 0]));
         let swap13 = [[0, 0, 1], [0, 1, 0], [1, 0, 0]];
         assert_eq!(
-            rows_closed_under_rotation(&reps.g, &reps.source_offsets, mesh, swap13),
+            g_points_closed_under_rotation(&selected.g, &selected.source_offsets, mesh, swap13),
             Ok(false)
         );
         assert_eq!(
-            rows_closed_under_rotation(&reps.g, &reps.source_offsets, mesh, IDENTITY),
+            g_points_closed_under_rotation(&selected.g, &selected.source_offsets, mesh, IDENTITY),
             Ok(true)
         );
     }
 
-    /// Every element of the outputs is written, also the bins without rows.
+    /// Every element of the outputs is written, also the bins without
+    /// g-points.
     #[test]
     fn every_bin_is_written() {
         let mesh = [4, 4, 4];
-        let reps = shortest_representatives(mesh, fcc_primitive_lattice());
+        let selected = shortest_g_points(mesh, fcc_primitive_lattice());
         let p2s = p2s_fcc();
         let fft_mesh = [3, 3, 3];
-        let sorted = sort_rows_by_bin(&reps.g, p2s, fft_mesh, IDENTITY).unwrap();
+        let sorted = sort_g_points_by_bin(&selected.g, p2s, fft_mesh, IDENTITY).unwrap();
         let num_empty = sorted
             .bin_offsets
             .windows(2)
@@ -922,12 +921,12 @@ mod tests {
         let fs = run(
             &coefs,
             mesh,
-            &reps,
+            &selected,
             p2s,
             fft_mesh,
             IDENTITY,
             three_fold(),
-            Some([0.25, 0.5, 0.125]),
+            [0.25, 0.5, 0.125],
         );
         assert!(fs[0].iter().all(|v| v[0].is_finite() && v[1].is_finite()));
         for (b, w) in sorted.bin_offsets.windows(2).enumerate() {
@@ -940,7 +939,7 @@ mod tests {
     #[test]
     fn independent_of_number_of_threads() {
         let mesh = [6, 6, 4];
-        let reps = shortest_representatives(mesh, hexagonal_lattice());
+        let selected = shortest_g_points(mesh, hexagonal_lattice());
         let coefs = vec![coefficients(144, 9)];
         let results: Vec<Vec<Vec<Cmplx>>> = [1, 3, 8]
             .iter()
@@ -953,12 +952,12 @@ mod tests {
                         run(
                             &coefs,
                             mesh,
-                            &reps,
+                            &selected,
                             [[2, 0, 0], [0, 2, 0], [0, 0, 1]],
                             [2, 3, 2],
                             six_fold(),
                             six_fold(),
-                            Some([0.3, 0.1, 0.2]),
+                            [0.3, 0.1, 0.2],
                         )
                     })
             })
@@ -974,15 +973,15 @@ mod tests {
         let singular = [[1, 0, 0], [0, 1, 0], [1, 1, 0]];
         let twice = [[2, 0, 0], [0, 1, 0], [0, 0, 1]];
         assert_eq!(
-            sort_rows_by_bin(&g, singular, [1, 1, 1], IDENTITY).err(),
+            sort_g_points_by_bin(&g, singular, [1, 1, 1], IDENTITY).err(),
             Some(E::SingularP2sMatrix)
         );
         assert_eq!(
-            sort_rows_by_bin(&g, IDENTITY, [1, 0, 1], IDENTITY).err(),
+            sort_g_points_by_bin(&g, IDENTITY, [1, 0, 1], IDENTITY).err(),
             Some(E::NonPositiveMesh)
         );
         assert_eq!(
-            sort_rows_by_bin(&g, IDENTITY, [1, 1, 1], twice).err(),
+            sort_g_points_by_bin(&g, IDENTITY, [1, 1, 1], twice).err(),
             Some(E::NonUnimodularRotation)
         );
 
@@ -1003,7 +1002,7 @@ mod tests {
                 source_weight,
                 bin_offsets,
                 rotation,
-                None,
+                [0.0; 3],
             )
         };
         assert_eq!(call(mesh, &weight, &[0, 1, 2], 2, IDENTITY), Ok(()));
@@ -1036,23 +1035,28 @@ mod tests {
             );
         }
 
-        let reps = box_representatives(mesh);
+        let selected = box_g_points(mesh);
         assert_eq!(
-            rows_closed_under_rotation(&reps.g, &reps.source_offsets, mesh, IDENTITY),
+            g_points_closed_under_rotation(&selected.g, &selected.source_offsets, mesh, IDENTITY),
             Ok(true)
         );
         assert_eq!(
-            rows_closed_under_rotation(&reps.g, &reps.source_offsets[1..], mesh, IDENTITY),
+            g_points_closed_under_rotation(
+                &selected.g,
+                &selected.source_offsets[1..],
+                mesh,
+                IDENTITY
+            ),
             Err(E::LengthMismatch)
         );
-        let mut reversed = reps.g.clone();
+        let mut reversed = selected.g.clone();
         reversed.reverse();
         assert_eq!(
-            rows_closed_under_rotation(&reversed, &reps.source_offsets, mesh, IDENTITY),
+            g_points_closed_under_rotation(&reversed, &selected.source_offsets, mesh, IDENTITY),
             Err(E::InvalidOffsets)
         );
         assert_eq!(
-            rows_closed_under_rotation(&reps.g, &reps.source_offsets, mesh, twice),
+            g_points_closed_under_rotation(&selected.g, &selected.source_offsets, mesh, twice),
             Err(E::NonUnimodularRotation)
         );
     }

@@ -13,15 +13,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `apply_inverse_normal_matrix`, the element-wise steps of the
   finite-difference derivative of the local potential in phelel.  Each
   works in place and in parallel.
-- `sort_rows_by_bin`, `bin_sorted_supercell_fourier_coefficients` and
-  `rows_closed_under_rotation`, which bin the Fourier coefficients of a
-  supercell for phelel in two steps: the rotated representatives are sorted
-  by bin, and the coefficients are summed over them.  When the
-  representatives are closed under a rotation, those sorted once are used
+- `sort_g_points_by_bin`, `bin_sorted_supercell_fourier_coefficients` and
+  `g_points_closed_under_rotation`, which bin the Fourier coefficients of a
+  supercell for phelel in two steps: the rotated selected g-points are
+  sorted by bin, and the coefficients are summed over them.  When the
+  selected g-points are closed under a rotation, those sorted once are used
   for it, without sorting for each symmetry operation.
 
 ### Removed
-- `bin_supercell_fourier_coefficients`.  Use `sort_rows_by_bin` and
+- `bin_supercell_fourier_coefficients`.  Use `sort_g_points_by_bin` and
   `bin_sorted_supercell_fourier_coefficients`.
 
 ## [0.7.0] - 2026-11-01
