@@ -1,9 +1,10 @@
-use numpy::ndarray::{Array1, Array2, Array3};
+use numpy::ndarray::{Array1, Array2, Array3, Dimension};
 use numpy::{
-    Complex64, IntoPyArray, PyArray1, PyArray2, PyArray3, PyArrayMethods, PyReadonlyArray1,
-    PyReadonlyArray2, PyReadonlyArray3, PyReadonlyArray4, PyReadonlyArray5, PyReadonlyArray6,
-    PyReadonlyArrayDyn, PyReadwriteArray1, PyReadwriteArray2, PyReadwriteArray3, PyReadwriteArray4,
-    PyReadwriteArray5, PyReadwriteArray6, PyReadwriteArrayDyn, PyUntypedArrayMethods,
+    Complex64, Element, IntoPyArray, PyArray1, PyArray2, PyArray3, PyArrayMethods, PyReadonlyArray,
+    PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArray3, PyReadonlyArray4, PyReadonlyArray5,
+    PyReadonlyArray6, PyReadonlyArrayDyn, PyReadwriteArray, PyReadwriteArray1, PyReadwriteArray2,
+    PyReadwriteArray3, PyReadwriteArray4, PyReadwriteArray5, PyReadwriteArray6,
+    PyReadwriteArrayDyn, PyUntypedArrayMethods,
 };
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -65,9 +66,7 @@ fn degenerate_ids_slice<'a>(
                     "degenerate_ids must have the shape of frequencies",
                 ));
             }
-            ids.as_slice()
-                .map(Some)
-                .map_err(|_| PyValueError::new_err("degenerate_ids must be C-contiguous"))
+            c_slice(ids, "degenerate_ids must be C-contiguous").map(Some)
         }
     }
 }
@@ -358,8 +357,6 @@ fn bin_error(name: &str, e: fourier_bins::FourierBinsError) -> PyErr {
 }
 
 /// g-points in an int64 array of the shape ``(n, 3)``, C-contiguous.
-///
-/// ``as_slice`` accepts Fortran order too, so C order is checked first.
 fn g_points_of<'a>(
     name: &str,
     what: &str,
@@ -370,13 +367,8 @@ fn g_points_of<'a>(
             "{name}: {what} must have shape (n, 3)"
         )));
     }
-    let not_contiguous = || PyValueError::new_err(format!("{name}: {what} must be C-contiguous"));
-    if !array.is_c_contiguous() {
-        return Err(not_contiguous());
-    }
-    Ok(group_as_array::<i64, 3>(
-        array.as_slice().map_err(|_| not_contiguous())?,
-    ))
+    let g_points = c_slice(array, &format!("{name}: {what} must be C-contiguous"))?;
+    Ok(group_as_array::<i64, 3>(g_points))
 }
 
 /// Sort the rotated selected g-points by bin.
@@ -490,18 +482,10 @@ fn py_bin_sorted_supercell_fourier_coefficients<'py>(
         )));
     }
     let supercell_mesh = [shape[2] as i64, shape[1] as i64, shape[0] as i64];
-    let contiguous =
-        |what: &str| PyValueError::new_err(format!("{name}: {what} must be C-contiguous"));
-    if coefficients.iter().any(|c| !c.is_c_contiguous()) {
-        return Err(contiguous("coefficients"));
-    }
+    let contiguous = |what: &str| format!("{name}: {what} must be C-contiguous");
     let g_sorted = g_points_of(name, "g_sorted", &g_sorted)?;
-    let source_weight = source_weight
-        .as_slice()
-        .map_err(|_| contiguous("source_weight"))?;
-    let bin_offsets = bin_offsets
-        .as_slice()
-        .map_err(|_| contiguous("bin_offsets"))?;
+    let source_weight = c_slice(&source_weight, &contiguous("source_weight"))?;
+    let bin_offsets = c_slice(&bin_offsets, &contiguous("bin_offsets"))?;
     let rot = mat3_i(&rotation)?;
     let trans = {
         let v = translation.as_array();
@@ -514,11 +498,7 @@ fn py_bin_sorted_supercell_fourier_coefficients<'py>(
     };
     let cs = coefficients
         .iter()
-        .map(|c| {
-            c.as_slice()
-                .map(complex_as_cmplx)
-                .map_err(|_| contiguous("coefficients"))
-        })
+        .map(|c| c_slice(c, &contiguous("coefficients")).map(complex_as_cmplx))
         .collect::<PyResult<Vec<_>>>()?;
     let num_bins = bin_offsets.len().saturating_sub(1);
     // Every element is written by the kernel, so the outputs are not
@@ -577,9 +557,10 @@ fn py_g_points_closed_under_rotation<'py>(
 ) -> PyResult<bool> {
     let name = "g_points_closed_under_rotation";
     let g_points = g_points_of(name, "g", &g)?;
-    let offsets = source_offsets.as_slice().map_err(|_| {
-        PyValueError::new_err(format!("{name}: source_offsets must be C-contiguous"))
-    })?;
+    let offsets = c_slice(
+        &source_offsets,
+        &format!("{name}: source_offsets must be C-contiguous"),
+    )?;
     let mesh = vec3_i(&supercell_mesh)?;
     let rot = mat3_i(&rotation)?;
     py.detach(|| fourier_bins::g_points_closed_under_rotation(g_points, offsets, mesh, rot))
@@ -605,12 +586,8 @@ fn py_multiply_by_phase<'py>(
             "multiply_by_phase: phi and phase must have the same shape",
         ));
     }
-    let phi = phi
-        .as_slice_mut()
-        .map_err(|_| PyValueError::new_err("multiply_by_phase: phi must be C-contiguous"))?;
-    let phase = phase
-        .as_slice()
-        .map_err(|_| PyValueError::new_err("multiply_by_phase: phase must be C-contiguous"))?;
+    let phi = c_slice_mut(&mut phi, "multiply_by_phase: phi must be C-contiguous")?;
+    let phase = c_slice(&phase, "multiply_by_phase: phase must be C-contiguous")?;
     let phi = complex_as_cmplx_mut(phi);
     let phase = complex_as_cmplx(phase);
     py.detach(|| potential_change::multiply_by_phase(phi, phase));
@@ -659,11 +636,11 @@ fn py_rotate_spin_components<'py>(
     let mut slices = values
         .iter_mut()
         .map(|v| {
-            v.as_slice_mut().map(complex_as_cmplx_mut).map_err(|_| {
-                PyValueError::new_err(
-                    "rotate_spin_components: spin components must be C-contiguous",
-                )
-            })
+            c_slice_mut(
+                v,
+                "rotate_spin_components: spin components must be C-contiguous",
+            )
+            .map(complex_as_cmplx_mut)
         })
         .collect::<PyResult<Vec<_>>>()?;
     py.detach(|| potential_change::rotate_spin_components(&mut slices, &spin_rotation));
@@ -700,11 +677,11 @@ fn py_apply_time_reversal_to_spin_components<'py>(
     let mut slices = values
         .iter_mut()
         .map(|v| {
-            v.as_slice_mut().map(complex_as_cmplx_mut).map_err(|_| {
-                PyValueError::new_err(
-                    "apply_time_reversal_to_spin_components: spin components must be C-contiguous",
-                )
-            })
+            c_slice_mut(
+                v,
+                "apply_time_reversal_to_spin_components: spin components must be C-contiguous",
+            )
+            .map(complex_as_cmplx_mut)
         })
         .collect::<PyResult<Vec<_>>>()?;
     py.detach(|| potential_change::apply_time_reversal_to_spin_components(&mut slices));
@@ -754,19 +731,18 @@ fn py_add_to_normal_equation_rhs<'py>(
             "add_to_normal_equation_rhs: normal_equation_rhs must have shape (len(values), 3, n_grid_points)",
         ));
     }
-    let normal_equation_rhs = normal_equation_rhs.as_slice_mut().map_err(|_| {
-        PyValueError::new_err(
-            "add_to_normal_equation_rhs: normal_equation_rhs must be C-contiguous",
-        )
-    })?;
+    let normal_equation_rhs = c_slice_mut(
+        &mut normal_equation_rhs,
+        "add_to_normal_equation_rhs: normal_equation_rhs must be C-contiguous",
+    )?;
     let slices = values
         .iter()
         .map(|value| {
-            value.as_slice().map(complex_as_cmplx).map_err(|_| {
-                PyValueError::new_err(
-                    "add_to_normal_equation_rhs: spin components must be C-contiguous",
-                )
-            })
+            c_slice(
+                value,
+                "add_to_normal_equation_rhs: spin components must be C-contiguous",
+            )
+            .map(complex_as_cmplx)
         })
         .collect::<PyResult<Vec<_>>>()?;
     let normal_equation_rhs = complex_as_cmplx_mut(normal_equation_rhs);
@@ -816,11 +792,10 @@ fn py_apply_inverse_normal_matrix<'py>(
         [elements[[1, 0]], elements[[1, 1]], elements[[1, 2]]],
         [elements[[2, 0]], elements[[2, 1]], elements[[2, 2]]],
     ];
-    let normal_equation_rhs = normal_equation_rhs.as_slice_mut().map_err(|_| {
-        PyValueError::new_err(
-            "apply_inverse_normal_matrix: normal_equation_rhs must be C-contiguous",
-        )
-    })?;
+    let normal_equation_rhs = c_slice_mut(
+        &mut normal_equation_rhs,
+        "apply_inverse_normal_matrix: normal_equation_rhs must be C-contiguous",
+    )?;
     let normal_equation_rhs = complex_as_cmplx_mut(normal_equation_rhs);
     py.detach(|| {
         potential_change::apply_inverse_normal_matrix(
@@ -849,10 +824,7 @@ fn py_rotate_bz_grid_index<'py>(
 ) -> PyResult<i64> {
     let rot = mat3_i(&rotation)?;
     let adrs = addresses_i(&bz_grid_addresses)?;
-    let bzmap_view = bz_map.as_array();
-    let bzmap_slice = bzmap_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("bz_map must be contiguous"))?;
+    let bzmap_slice = c_slice(&bz_map, "bz_map must be contiguous")?;
     let d = vec3_i(&d_diag)?;
     let p = vec3_i(&ps)?;
     match bzgrid::rotate_bz_grid_index(bz_grid_index, rot, &adrs, bzmap_slice, d, p, bz_grid_type) {
@@ -910,14 +882,8 @@ fn py_bz_triplets_at_q<'py>(
     bz_grid_type: i64,
 ) -> PyResult<Bound<'py, PyArray2<i64>>> {
     let adrs = addresses_i(&bz_grid_addresses)?;
-    let bzmap_view = bz_map.as_array();
-    let bzmap_slice = bzmap_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("bz_map must be contiguous"))?;
-    let mtv = map_triplets.as_array();
-    let map_triplets_slice = mtv
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("map_triplets must be contiguous"))?;
+    let bzmap_slice = c_slice(&bz_map, "bz_map must be contiguous")?;
+    let map_triplets_slice = c_slice(&map_triplets, "map_triplets must be contiguous")?;
     let d = vec3_i(&d_diag)?;
     let qm = mat3_i(&q)?;
     let rec = mat3_f(&reciprocal_lattice)?;
@@ -967,33 +933,17 @@ fn py_triplets_integration_weights<'py>(
     let rga = relative_grid_addresses(&relative_grid_address)?;
     let trip = addresses_i(&triplets)?;
     let adrs = addresses_i(&bz_grid_addresses)?;
-    let bzmap_view = bz_map.as_array();
-    let bzmap_slice = bzmap_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("bz_map must be C-contiguous"))?;
+    let bzmap_slice = c_slice(&bz_map, "bz_map must be C-contiguous")?;
     let d = vec3_i(&d_diag)?;
 
-    let fp_view = frequency_points.as_array();
-    let fp_slice = fp_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("frequency_points must be C-contiguous"))?;
-    let f1_view = frequencies1.as_array();
-    let f1_slice = f1_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("frequencies1 must be C-contiguous"))?;
-    let f2_view = frequencies2.as_array();
-    let f2_slice = f2_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("frequencies2 must be C-contiguous"))?;
+    let fp_slice = c_slice(&frequency_points, "frequency_points must be C-contiguous")?;
+    let f1_slice = c_slice(&frequencies1, "frequencies1 must be C-contiguous")?;
+    let f2_slice = c_slice(&frequencies2, "frequencies2 must be C-contiguous")?;
     let num_band1 = frequencies1.shape()[1] as i64;
     let num_band2 = frequencies2.shape()[1] as i64;
 
-    let iw_slice = iw
-        .as_slice_mut()
-        .map_err(|_| PyValueError::new_err("iw must be C-contiguous"))?;
-    let iwz_slice = iw_zero
-        .as_slice_mut()
-        .map_err(|_| PyValueError::new_err("iw_zero must be C-contiguous"))?;
+    let iw_slice = c_slice_mut(&mut iw, "iw must be C-contiguous")?;
+    let iwz_slice = c_slice_mut(&mut iw_zero, "iw_zero must be C-contiguous")?;
 
     py.detach(|| {
         let bzgrid = BzGridView {
@@ -1037,21 +987,11 @@ fn py_triplets_integration_weights_with_sigma<'py>(
     let trip = addresses_i(&triplets)?;
     let num_band = frequencies.shape()[1] as i64;
 
-    let fp_view = frequency_points.as_array();
-    let fp_slice = fp_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("frequency_points must be C-contiguous"))?;
-    let f_view = frequencies.as_array();
-    let f_slice = f_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("frequencies must be C-contiguous"))?;
+    let fp_slice = c_slice(&frequency_points, "frequency_points must be C-contiguous")?;
+    let f_slice = c_slice(&frequencies, "frequencies must be C-contiguous")?;
 
-    let iw_slice = iw
-        .as_slice_mut()
-        .map_err(|_| PyValueError::new_err("iw must be C-contiguous"))?;
-    let iwz_slice = iw_zero
-        .as_slice_mut()
-        .map_err(|_| PyValueError::new_err("iw_zero must be C-contiguous"))?;
+    let iw_slice = c_slice_mut(&mut iw, "iw must be C-contiguous")?;
+    let iwz_slice = c_slice_mut(&mut iw_zero, "iw_zero must be C-contiguous")?;
 
     py.detach(|| {
         let inner_par = trip.len() < rayon::current_num_threads();
@@ -1069,6 +1009,37 @@ fn py_triplets_integration_weights_with_sigma<'py>(
         );
     });
     Ok(())
+}
+
+/// Data of a C-contiguous array as a flat slice.
+///
+/// ``as_slice`` of rust-numpy accepts Fortran order too, and the data of an
+/// array of two or more dimensions in Fortran order would be read in the
+/// wrong order.  Returns ``ValueError`` with ``message`` unless the array is
+/// C-contiguous and aligned.
+fn c_slice<'a, T: Element, D: Dimension>(
+    array: &'a PyReadonlyArray<'_, T, D>,
+    message: &str,
+) -> PyResult<&'a [T]> {
+    if !array.is_c_contiguous() {
+        return Err(PyValueError::new_err(message.to_owned()));
+    }
+    array
+        .as_slice()
+        .map_err(|_| PyValueError::new_err(message.to_owned()))
+}
+
+/// Data of a C-contiguous array as a flat mutable slice, as ``c_slice``.
+fn c_slice_mut<'a, T: Element, D: Dimension>(
+    array: &'a mut PyReadwriteArray<'_, T, D>,
+    message: &str,
+) -> PyResult<&'a mut [T]> {
+    if !array.is_c_contiguous() {
+        return Err(PyValueError::new_err(message.to_owned()));
+    }
+    array
+        .as_slice_mut()
+        .map_err(|_| PyValueError::new_err(message.to_owned()))
 }
 
 /// Reinterpret a `Complex64` slice as `[f64; 2]` slice (`Cmplx`).
@@ -1170,40 +1141,20 @@ fn py_dynamical_matrix_at_q<'py>(
     let q_view = q.as_array();
     let q3 = [q_view[0], q_view[1], q_view[2]];
 
-    let svecs_view = svecs.as_array();
-    let svecs_flat = svecs_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("svecs must be C-contiguous"))?;
+    let svecs_flat = c_slice(&svecs, "svecs must be C-contiguous")?;
     let svecs_slice: &[[f64; 3]] = group_as_array(svecs_flat);
 
-    let multi_view = multi.as_array();
-    let multi_flat = multi_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("multi must be C-contiguous"))?;
+    let multi_flat = c_slice(&multi, "multi must be C-contiguous")?;
     let multi_slice: &[[i64; 2]] = group_as_array(multi_flat);
 
-    let mass_view = mass.as_array();
-    let mass_slice = mass_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("mass must be C-contiguous"))?;
+    let mass_slice = c_slice(&mass, "mass must be C-contiguous")?;
 
-    let s2p_view = s2p_map.as_array();
-    let s2p_slice = s2p_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("s2p_map must be C-contiguous"))?;
+    let s2p_slice = c_slice(&s2p_map, "s2p_map must be C-contiguous")?;
 
-    let p2s_view = p2s_map.as_array();
-    let p2s_slice = p2s_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("p2s_map must be C-contiguous"))?;
+    let p2s_slice = c_slice(&p2s_map, "p2s_map must be C-contiguous")?;
 
-    let fc_view = fc.as_array();
-    let fc_slice = fc_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("fc must be C-contiguous"))?;
+    let fc_slice = c_slice(&fc, "fc must be C-contiguous")?;
 
-    let cs_view;
-    let cs_flat;
     let cs: Option<&[[[f64; 3]; 3]]> = match charge_sum.as_ref() {
         None => None,
         Some(cs_arr) => {
@@ -1212,17 +1163,15 @@ fn py_dynamical_matrix_at_q<'py>(
                     "charge_sum must have shape (num_patom, num_patom, 3, 3)",
                 ));
             }
-            cs_view = cs_arr.as_array();
-            cs_flat = cs_view
-                .as_slice()
-                .ok_or_else(|| PyValueError::new_err("charge_sum must be C-contiguous"))?;
+            let cs_flat = c_slice(cs_arr, "charge_sum must be C-contiguous")?;
             Some(group_as_array_2d::<f64, 3, 3>(cs_flat))
         }
     };
 
-    let dm_slice = dynamical_matrix
-        .as_slice_mut()
-        .map_err(|_| PyValueError::new_err("dynamical_matrix must be C-contiguous"))?;
+    let dm_slice = c_slice_mut(
+        &mut dynamical_matrix,
+        "dynamical_matrix must be C-contiguous",
+    )?;
     let dm_cmplx = complex_as_cmplx_mut(dm_slice);
 
     py.detach(|| {
@@ -1278,15 +1227,10 @@ fn py_charge_sum<'py>(
     let q_view = q_cart.as_array();
     let q3 = [q_view[0], q_view[1], q_view[2]];
 
-    let born_view = born.as_array();
-    let born_flat = born_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("born must be C-contiguous"))?;
+    let born_flat = c_slice(&born, "born must be C-contiguous")?;
     let born_slice: &[[[f64; 3]; 3]] = group_as_array_2d::<f64, 3, 3>(born_flat);
 
-    let cs_slice = charge_sum
-        .as_slice_mut()
-        .map_err(|_| PyValueError::new_err("charge_sum must be C-contiguous"))?;
+    let cs_slice = c_slice_mut(&mut charge_sum, "charge_sum must be C-contiguous")?;
     let cs_blocks: &mut [[[f64; 3]; 3]] = {
         debug_assert_eq!(cs_slice.len() % 9, 0);
         let n = cs_slice.len() / 9;
@@ -1340,27 +1284,16 @@ fn py_recip_dipole_dipole_q0<'py>(
 
     let diel = mat3_f(&dielectric)?;
 
-    let g_view = g_list.as_array();
-    let g_flat = g_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("g_list must be C-contiguous"))?;
+    let g_flat = c_slice(&g_list, "g_list must be C-contiguous")?;
     let g_slice: &[[f64; 3]] = group_as_array(g_flat);
 
-    let pos_view = pos.as_array();
-    let pos_flat = pos_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("pos must be C-contiguous"))?;
+    let pos_flat = c_slice(&pos, "pos must be C-contiguous")?;
     let pos_slice: &[[f64; 3]] = group_as_array(pos_flat);
 
-    let born_view = born.as_array();
-    let born_flat = born_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("born must be C-contiguous"))?;
+    let born_flat = c_slice(&born, "born must be C-contiguous")?;
     let born_slice: &[[[f64; 3]; 3]] = group_as_array_2d::<f64, 3, 3>(born_flat);
 
-    let dd_slice = dd_q0
-        .as_slice_mut()
-        .map_err(|_| PyValueError::new_err("dd_q0 must be C-contiguous"))?;
+    let dd_slice = c_slice_mut(&mut dd_q0, "dd_q0 must be C-contiguous")?;
     let dd_cmplx = complex_as_cmplx_mut(dd_slice);
 
     py.detach(|| {
@@ -1442,37 +1375,23 @@ fn py_recip_dipole_dipole<'py>(
         }
     };
 
-    let g_view = g_list.as_array();
-    let g_flat = g_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("g_list must be C-contiguous"))?;
+    let g_flat = c_slice(&g_list, "g_list must be C-contiguous")?;
     let g_slice: &[[f64; 3]] = group_as_array(g_flat);
 
-    let pos_view = pos.as_array();
-    let pos_flat = pos_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("pos must be C-contiguous"))?;
+    let pos_flat = c_slice(&pos, "pos must be C-contiguous")?;
     let pos_slice: &[[f64; 3]] = group_as_array(pos_flat);
 
-    let born_view = born.as_array();
-    let born_flat = born_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("born must be C-contiguous"))?;
+    let born_flat = c_slice(&born, "born must be C-contiguous")?;
     let born_slice: &[[[f64; 3]; 3]] = group_as_array_2d::<f64, 3, 3>(born_flat);
 
-    let dd_q0_view = dd_q0.as_array();
-    let dd_q0_flat = dd_q0_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("dd_q0 must be C-contiguous"))?;
+    let dd_q0_flat = c_slice(&dd_q0, "dd_q0 must be C-contiguous")?;
     let dd_q0_cmplx: &[Cmplx] = {
         let n = dd_q0_flat.len();
         let ptr = dd_q0_flat.as_ptr() as *const Cmplx;
         unsafe { std::slice::from_raw_parts(ptr, n) }
     };
 
-    let dd_slice = dd
-        .as_slice_mut()
-        .map_err(|_| PyValueError::new_err("dd must be C-contiguous"))?;
+    let dd_slice = c_slice_mut(&mut dd, "dd must be C-contiguous")?;
     let dd_cmplx = complex_as_cmplx_mut(dd_slice);
 
     py.detach(|| {
@@ -1551,27 +1470,16 @@ fn py_derivative_recip_dipole_dipole<'py>(
         }
     };
 
-    let g_view = g_list.as_array();
-    let g_flat = g_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("g_list must be C-contiguous"))?;
+    let g_flat = c_slice(&g_list, "g_list must be C-contiguous")?;
     let g_slice: &[[f64; 3]] = group_as_array(g_flat);
 
-    let pos_view = pos.as_array();
-    let pos_flat = pos_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("pos must be C-contiguous"))?;
+    let pos_flat = c_slice(&pos, "pos must be C-contiguous")?;
     let pos_slice: &[[f64; 3]] = group_as_array(pos_flat);
 
-    let born_view = born.as_array();
-    let born_flat = born_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("born must be C-contiguous"))?;
+    let born_flat = c_slice(&born, "born must be C-contiguous")?;
     let born_slice: &[[[f64; 3]; 3]] = group_as_array_2d::<f64, 3, 3>(born_flat);
 
-    let dd_slice = dd
-        .as_slice_mut()
-        .map_err(|_| PyValueError::new_err("dd must be C-contiguous"))?;
+    let dd_slice = c_slice_mut(&mut dd, "dd must be C-contiguous")?;
     let dd_cmplx = complex_as_cmplx_mut(dd_slice);
 
     py.detach(|| {
@@ -1664,42 +1572,23 @@ fn py_dynamical_matrices_at_gridpoints<'py>(
     let qd = mat3_f(&qd_inv)?;
     let ga = addresses_i(&grid_addresses)?;
 
-    let ug_view = undone_grid_points.as_array();
-    let ug_slice = ug_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("undone_grid_points must be C-contiguous"))?;
+    let ug_slice = c_slice(
+        &undone_grid_points,
+        "undone_grid_points must be C-contiguous",
+    )?;
 
-    let fc_view = fc.as_array();
-    let fc_slice = fc_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("fc must be C-contiguous"))?;
+    let fc_slice = c_slice(&fc, "fc must be C-contiguous")?;
 
-    let svecs_view = svecs.as_array();
-    let svecs_flat = svecs_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("svecs must be C-contiguous"))?;
+    let svecs_flat = c_slice(&svecs, "svecs must be C-contiguous")?;
     let svecs_slice: &[[f64; 3]] = group_as_array(svecs_flat);
 
-    let multi_view = multi.as_array();
-    let multi_flat = multi_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("multi must be C-contiguous"))?;
+    let multi_flat = c_slice(&multi, "multi must be C-contiguous")?;
     let multi_slice: &[[i64; 2]] = group_as_array(multi_flat);
 
-    let mass_view = mass.as_array();
-    let mass_slice = mass_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("mass must be C-contiguous"))?;
-    let p2s_view = p2s_map.as_array();
-    let p2s_slice = p2s_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("p2s_map must be C-contiguous"))?;
-    let s2p_view = s2p_map.as_array();
-    let s2p_slice = s2p_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("s2p_map must be C-contiguous"))?;
+    let mass_slice = c_slice(&mass, "mass must be C-contiguous")?;
+    let p2s_slice = c_slice(&p2s_map, "p2s_map must be C-contiguous")?;
+    let s2p_slice = c_slice(&s2p_map, "s2p_map must be C-contiguous")?;
 
-    let born_view;
     let wang = match born.as_ref() {
         None => None,
         Some(b) => {
@@ -1716,10 +1605,7 @@ fn py_dynamical_matrices_at_gridpoints<'py>(
             }
             let diel = mat3_f(diel_arr)?;
             let rec = mat3_f(rec_arr)?;
-            born_view = b.as_array();
-            let born_flat = born_view
-                .as_slice()
-                .ok_or_else(|| PyValueError::new_err("born must be C-contiguous"))?;
+            let born_flat = c_slice(b, "born must be C-contiguous")?;
             let born_slice: &[[[f64; 3]; 3]] = group_as_array_2d::<f64, 3, 3>(born_flat);
 
             let qd_dir: Option<[f64; 3]> = match q_direction.as_ref() {
@@ -1742,9 +1628,7 @@ fn py_dynamical_matrices_at_gridpoints<'py>(
         }
     };
 
-    let dm_slice = dynmats
-        .as_slice_mut()
-        .map_err(|_| PyValueError::new_err("dynmats must be C-contiguous"))?;
+    let dm_slice = c_slice_mut(&mut dynmats, "dynmats must be C-contiguous")?;
     let dm_cmplx = complex_as_cmplx_mut(dm_slice);
 
     py.detach(|| {
@@ -1878,63 +1762,33 @@ fn py_dynamical_matrices_at_gridpoints_gonze<'py>(
         }
     };
 
-    let ug_view = undone_grid_points.as_array();
-    let ug_slice = ug_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("undone_grid_points must be C-contiguous"))?;
+    let ug_slice = c_slice(
+        &undone_grid_points,
+        "undone_grid_points must be C-contiguous",
+    )?;
 
-    let fc_view = fc.as_array();
-    let fc_slice = fc_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("fc must be C-contiguous"))?;
+    let fc_slice = c_slice(&fc, "fc must be C-contiguous")?;
 
-    let svecs_view = svecs.as_array();
-    let svecs_flat = svecs_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("svecs must be C-contiguous"))?;
+    let svecs_flat = c_slice(&svecs, "svecs must be C-contiguous")?;
     let svecs_slice: &[[f64; 3]] = group_as_array(svecs_flat);
 
-    let multi_view = multi.as_array();
-    let multi_flat = multi_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("multi must be C-contiguous"))?;
+    let multi_flat = c_slice(&multi, "multi must be C-contiguous")?;
     let multi_slice: &[[i64; 2]] = group_as_array(multi_flat);
 
-    let mass_view = mass.as_array();
-    let mass_slice = mass_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("mass must be C-contiguous"))?;
-    let p2s_view = p2s_map.as_array();
-    let p2s_slice = p2s_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("p2s_map must be C-contiguous"))?;
-    let s2p_view = s2p_map.as_array();
-    let s2p_slice = s2p_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("s2p_map must be C-contiguous"))?;
+    let mass_slice = c_slice(&mass, "mass must be C-contiguous")?;
+    let p2s_slice = c_slice(&p2s_map, "p2s_map must be C-contiguous")?;
+    let s2p_slice = c_slice(&s2p_map, "s2p_map must be C-contiguous")?;
 
-    let born_view = born.as_array();
-    let born_flat = born_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("born must be C-contiguous"))?;
+    let born_flat = c_slice(&born, "born must be C-contiguous")?;
     let born_slice: &[[[f64; 3]; 3]] = group_as_array_2d::<f64, 3, 3>(born_flat);
 
-    let pos_view = pos.as_array();
-    let pos_flat = pos_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("pos must be C-contiguous"))?;
+    let pos_flat = c_slice(&pos, "pos must be C-contiguous")?;
     let pos_slice: &[[f64; 3]] = group_as_array(pos_flat);
 
-    let g_view = g_list.as_array();
-    let g_flat = g_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("g_list must be C-contiguous"))?;
+    let g_flat = c_slice(&g_list, "g_list must be C-contiguous")?;
     let g_slice: &[[f64; 3]] = group_as_array(g_flat);
 
-    let dd_q0_view = dd_q0.as_array();
-    let dd_q0_flat = dd_q0_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("dd_q0 must be C-contiguous"))?;
+    let dd_q0_flat = c_slice(&dd_q0, "dd_q0 must be C-contiguous")?;
     let dd_q0_cmplx: &[Cmplx] = {
         let n = dd_q0_flat.len();
         let ptr = dd_q0_flat.as_ptr() as *const Cmplx;
@@ -1953,9 +1807,7 @@ fn py_dynamical_matrices_at_gridpoints_gonze<'py>(
         lambda: lambda_,
     };
 
-    let dm_slice = dynmats
-        .as_slice_mut()
-        .map_err(|_| PyValueError::new_err("dynmats must be C-contiguous"))?;
+    let dm_slice = c_slice_mut(&mut dynmats, "dynmats must be C-contiguous")?;
     let dm_cmplx = complex_as_cmplx_mut(dm_slice);
 
     py.detach(|| {
@@ -2047,40 +1899,18 @@ fn py_dynamical_matrices_at_qpoints<'py>(
         return Err(PyValueError::new_err("mass must have shape (num_patom,)"));
     }
 
-    let qpoints_view = qpoints.as_array();
-    let qpoints_flat = qpoints_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("qpoints must be C-contiguous"))?;
+    let qpoints_flat = c_slice(&qpoints, "qpoints must be C-contiguous")?;
     let qpoints_slice: &[[f64; 3]] = group_as_array(qpoints_flat);
 
-    let fc_view = fc.as_array();
-    let fc_slice = fc_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("fc must be C-contiguous"))?;
-    let svecs_view = svecs.as_array();
-    let svecs_flat = svecs_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("svecs must be C-contiguous"))?;
+    let fc_slice = c_slice(&fc, "fc must be C-contiguous")?;
+    let svecs_flat = c_slice(&svecs, "svecs must be C-contiguous")?;
     let svecs_slice: &[[f64; 3]] = group_as_array(svecs_flat);
-    let multi_view = multi.as_array();
-    let multi_flat = multi_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("multi must be C-contiguous"))?;
+    let multi_flat = c_slice(&multi, "multi must be C-contiguous")?;
     let multi_slice: &[[i64; 2]] = group_as_array(multi_flat);
-    let mass_view = mass.as_array();
-    let mass_slice = mass_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("mass must be C-contiguous"))?;
-    let p2s_view = p2s_map.as_array();
-    let p2s_slice = p2s_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("p2s_map must be C-contiguous"))?;
-    let s2p_view = s2p_map.as_array();
-    let s2p_slice = s2p_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("s2p_map must be C-contiguous"))?;
+    let mass_slice = c_slice(&mass, "mass must be C-contiguous")?;
+    let p2s_slice = c_slice(&p2s_map, "p2s_map must be C-contiguous")?;
+    let s2p_slice = c_slice(&s2p_map, "s2p_map must be C-contiguous")?;
 
-    let born_view;
     let wang = match born.as_ref() {
         None => None,
         Some(b) => {
@@ -2097,10 +1927,7 @@ fn py_dynamical_matrices_at_qpoints<'py>(
             }
             let diel = mat3_f(diel_arr)?;
             let rec = mat3_f(rec_arr)?;
-            born_view = b.as_array();
-            let born_flat = born_view
-                .as_slice()
-                .ok_or_else(|| PyValueError::new_err("born must be C-contiguous"))?;
+            let born_flat = c_slice(b, "born must be C-contiguous")?;
             let born_slice: &[[[f64; 3]; 3]] = group_as_array_2d::<f64, 3, 3>(born_flat);
             let qd_dir: Option<[f64; 3]> = match q_direction.as_ref() {
                 None => None,
@@ -2122,9 +1949,7 @@ fn py_dynamical_matrices_at_qpoints<'py>(
         }
     };
 
-    let dm_slice = dynmats
-        .as_slice_mut()
-        .map_err(|_| PyValueError::new_err("dynmats must be C-contiguous"))?;
+    let dm_slice = c_slice_mut(&mut dynmats, "dynmats must be C-contiguous")?;
     let dm_cmplx = complex_as_cmplx_mut(dm_slice);
 
     py.detach(|| {
@@ -2230,61 +2055,28 @@ fn py_dynamical_matrices_at_qpoints_gonze<'py>(
     let diel = mat3_f(&dielectric)?;
     let rec = mat3_f(&reciprocal_lattice)?;
 
-    let qpoints_view = qpoints.as_array();
-    let qpoints_flat = qpoints_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("qpoints must be C-contiguous"))?;
+    let qpoints_flat = c_slice(&qpoints, "qpoints must be C-contiguous")?;
     let qpoints_slice: &[[f64; 3]] = group_as_array(qpoints_flat);
 
-    let fc_view = fc.as_array();
-    let fc_slice = fc_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("fc must be C-contiguous"))?;
-    let svecs_view = svecs.as_array();
-    let svecs_flat = svecs_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("svecs must be C-contiguous"))?;
+    let fc_slice = c_slice(&fc, "fc must be C-contiguous")?;
+    let svecs_flat = c_slice(&svecs, "svecs must be C-contiguous")?;
     let svecs_slice: &[[f64; 3]] = group_as_array(svecs_flat);
-    let multi_view = multi.as_array();
-    let multi_flat = multi_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("multi must be C-contiguous"))?;
+    let multi_flat = c_slice(&multi, "multi must be C-contiguous")?;
     let multi_slice: &[[i64; 2]] = group_as_array(multi_flat);
-    let mass_view = mass.as_array();
-    let mass_slice = mass_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("mass must be C-contiguous"))?;
-    let p2s_view = p2s_map.as_array();
-    let p2s_slice = p2s_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("p2s_map must be C-contiguous"))?;
-    let s2p_view = s2p_map.as_array();
-    let s2p_slice = s2p_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("s2p_map must be C-contiguous"))?;
-    let born_view = born.as_array();
-    let born_flat = born_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("born must be C-contiguous"))?;
+    let mass_slice = c_slice(&mass, "mass must be C-contiguous")?;
+    let p2s_slice = c_slice(&p2s_map, "p2s_map must be C-contiguous")?;
+    let s2p_slice = c_slice(&s2p_map, "s2p_map must be C-contiguous")?;
+    let born_flat = c_slice(&born, "born must be C-contiguous")?;
     let born_slice: &[[[f64; 3]; 3]] = group_as_array_2d::<f64, 3, 3>(born_flat);
-    let pos_view = pos.as_array();
-    let pos_flat = pos_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("pos must be C-contiguous"))?;
+    let pos_flat = c_slice(&pos, "pos must be C-contiguous")?;
     let pos_slice: &[[f64; 3]] = group_as_array(pos_flat);
-    let dd_view = dd_q0.as_array();
-    let dd_flat = dd_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("dd_q0 must be C-contiguous"))?;
+    let dd_flat = c_slice(&dd_q0, "dd_q0 must be C-contiguous")?;
     let dd_cmplx: &[Cmplx] = {
         let n = dd_flat.len();
         let ptr = dd_flat.as_ptr() as *const Cmplx;
         unsafe { std::slice::from_raw_parts(ptr, n) }
     };
-    let g_view = g_list.as_array();
-    let g_flat = g_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("g_list must be C-contiguous"))?;
+    let g_flat = c_slice(&g_list, "g_list must be C-contiguous")?;
     let g_slice: &[[f64; 3]] = group_as_array(g_flat);
 
     let qd_dir: Option<[f64; 3]> = match q_direction.as_ref() {
@@ -2310,9 +2102,7 @@ fn py_dynamical_matrices_at_qpoints_gonze<'py>(
         lambda: lambda_,
     };
 
-    let dm_slice = dynmats
-        .as_slice_mut()
-        .map_err(|_| PyValueError::new_err("dynmats must be C-contiguous"))?;
+    let dm_slice = c_slice_mut(&mut dynmats, "dynmats must be C-contiguous")?;
     let dm_cmplx = complex_as_cmplx_mut(dm_slice);
 
     py.detach(|| {
@@ -2414,34 +2204,15 @@ fn py_derivative_dynmat_at_q<'py>(
     let q_view = q.as_array();
     let q3 = [q_view[0], q_view[1], q_view[2]];
 
-    let fc_view = fc.as_array();
-    let fc_slice = fc_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("fc must be C-contiguous"))?;
-    let svecs_view = svecs.as_array();
-    let svecs_flat = svecs_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("svecs must be C-contiguous"))?;
+    let fc_slice = c_slice(&fc, "fc must be C-contiguous")?;
+    let svecs_flat = c_slice(&svecs, "svecs must be C-contiguous")?;
     let svecs_slice: &[[f64; 3]] = group_as_array(svecs_flat);
-    let multi_view = multi.as_array();
-    let multi_flat = multi_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("multi must be C-contiguous"))?;
+    let multi_flat = c_slice(&multi, "multi must be C-contiguous")?;
     let multi_slice: &[[i64; 2]] = group_as_array(multi_flat);
-    let mass_view = mass.as_array();
-    let mass_slice = mass_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("mass must be C-contiguous"))?;
-    let s2p_view = s2p_map.as_array();
-    let s2p_slice = s2p_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("s2p_map must be C-contiguous"))?;
-    let fc_row_view = fc_row_map.as_array();
-    let fc_row_slice = fc_row_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("fc_row_map must be C-contiguous"))?;
+    let mass_slice = c_slice(&mass, "mass must be C-contiguous")?;
+    let s2p_slice = c_slice(&s2p_map, "s2p_map must be C-contiguous")?;
+    let fc_row_slice = c_slice(&fc_row_map, "fc_row_map must be C-contiguous")?;
 
-    let born_view;
     let nac = match born.as_ref() {
         None => None,
         Some(b) => {
@@ -2454,10 +2225,7 @@ fn py_derivative_dynmat_at_q<'py>(
                 ));
             }
             let diel = mat3_f(diel_arr)?;
-            born_view = b.as_array();
-            let born_flat = born_view
-                .as_slice()
-                .ok_or_else(|| PyValueError::new_err("born must be C-contiguous"))?;
+            let born_flat = c_slice(b, "born must be C-contiguous")?;
             let born_slice: &[[[f64; 3]; 3]] = group_as_array_2d::<f64, 3, 3>(born_flat);
             let qd: Option<[f64; 3]> = match q_direction.as_ref() {
                 None => None,
@@ -2478,9 +2246,7 @@ fn py_derivative_dynmat_at_q<'py>(
         }
     };
 
-    let ddm_slice = ddm
-        .as_slice_mut()
-        .map_err(|_| PyValueError::new_err("ddm must be C-contiguous"))?;
+    let ddm_slice = c_slice_mut(&mut ddm, "ddm must be C-contiguous")?;
     let ddm_cmplx = complex_as_cmplx_mut(ddm_slice);
 
     py.detach(|| {
@@ -2583,52 +2349,29 @@ fn py_transform_dynmat_to_fc<'py>(
     }
     let _ = n_fc_dim0;
 
-    let dm_view = dm.as_array();
-    let dm_flat = dm_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("dm must be C-contiguous"))?;
+    let dm_flat = c_slice(&dm, "dm must be C-contiguous")?;
     let dm_cmplx: &[Cmplx] = {
         let n = dm_flat.len();
         let ptr = dm_flat.as_ptr() as *const Cmplx;
         unsafe { std::slice::from_raw_parts(ptr, n) }
     };
 
-    let comm_view = comm_points.as_array();
-    let comm_flat = comm_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("comm_points must be C-contiguous"))?;
+    let comm_flat = c_slice(&comm_points, "comm_points must be C-contiguous")?;
     let comm_slice: &[[f64; 3]] = group_as_array(comm_flat);
 
-    let svecs_view = svecs.as_array();
-    let svecs_flat = svecs_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("svecs must be C-contiguous"))?;
+    let svecs_flat = c_slice(&svecs, "svecs must be C-contiguous")?;
     let svecs_slice: &[[f64; 3]] = group_as_array(svecs_flat);
 
-    let multi_view = multi.as_array();
-    let multi_flat = multi_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("multi must be C-contiguous"))?;
+    let multi_flat = c_slice(&multi, "multi must be C-contiguous")?;
     let multi_slice: &[[i64; 2]] = group_as_array(multi_flat);
 
-    let masses_view = masses.as_array();
-    let masses_slice = masses_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("masses must be C-contiguous"))?;
+    let masses_slice = c_slice(&masses, "masses must be C-contiguous")?;
 
-    let s2pp_view = s2pp_map.as_array();
-    let s2pp_slice = s2pp_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("s2pp_map must be C-contiguous"))?;
+    let s2pp_slice = c_slice(&s2pp_map, "s2pp_map must be C-contiguous")?;
 
-    let fc_idx_view = fc_index_map.as_array();
-    let fc_idx_slice = fc_idx_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("fc_index_map must be C-contiguous"))?;
+    let fc_idx_slice = c_slice(&fc_index_map, "fc_index_map must be C-contiguous")?;
 
-    let fc_slice = fc
-        .as_slice_mut()
-        .map_err(|_| PyValueError::new_err("fc must be C-contiguous"))?;
+    let fc_slice = c_slice_mut(&mut fc, "fc must be C-contiguous")?;
 
     py.detach(|| {
         dynmat::transform_dynmat_to_fc(
@@ -2720,44 +2463,21 @@ fn py_real_to_reciprocal<'py>(
         [q_view[[2, 0]], q_view[[2, 1]], q_view[[2, 2]]],
     ];
 
-    let svecs_view = svecs.as_array();
-    let svecs_flat = svecs_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("svecs must be C-contiguous"))?;
+    let svecs_flat = c_slice(&svecs, "svecs must be C-contiguous")?;
     let svecs_slice: &[[f64; 3]] = group_as_array(svecs_flat);
 
-    let multi_view = multiplicity.as_array();
-    let multi_flat = multi_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("multiplicity must be C-contiguous"))?;
+    let multi_flat = c_slice(&multiplicity, "multiplicity must be C-contiguous")?;
     let multi_slice: &[[i64; 2]] = group_as_array(multi_flat);
 
-    let p2s_view = p2s_map.as_array();
-    let p2s_slice = p2s_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("p2s_map must be C-contiguous"))?;
-    let s2p_view = s2p_map.as_array();
-    let s2p_slice = s2p_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("s2p_map must be C-contiguous"))?;
+    let p2s_slice = c_slice(&p2s_map, "p2s_map must be C-contiguous")?;
+    let s2p_slice = c_slice(&s2p_map, "s2p_map must be C-contiguous")?;
 
-    let all_short_view = all_shortest.as_array();
-    let all_short_slice = all_short_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("all_shortest must be C-contiguous"))?;
-    let nonzero_view = nonzero_indices.as_array();
-    let nonzero_slice = nonzero_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("nonzero_indices must be C-contiguous"))?;
+    let all_short_slice = c_slice(&all_shortest, "all_shortest must be C-contiguous")?;
+    let nonzero_slice = c_slice(&nonzero_indices, "nonzero_indices must be C-contiguous")?;
 
-    let fc3_view = fc3.as_array();
-    let fc3_slice = fc3_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("fc3 must be C-contiguous"))?;
+    let fc3_slice = c_slice(&fc3, "fc3 must be C-contiguous")?;
 
-    let rec_slice = fc3_reciprocal
-        .as_slice_mut()
-        .map_err(|_| PyValueError::new_err("fc3_reciprocal must be C-contiguous"))?;
+    let rec_slice = c_slice_mut(&mut fc3_reciprocal, "fc3_reciprocal must be C-contiguous")?;
     let rec_cmplx = complex_as_cmplx_mut(rec_slice);
 
     py.detach(|| {
@@ -2864,60 +2584,31 @@ fn py_reciprocal_to_normal_squared<'py>(
         unsafe { std::slice::from_raw_parts(ptr, n) }
     };
 
-    let g_pos_view = g_pos.as_array();
-    let g_pos_flat = g_pos_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("g_pos must be C-contiguous"))?;
+    let g_pos_flat = c_slice(&g_pos, "g_pos must be C-contiguous")?;
     let g_pos_slice: &[[i64; 4]] = group_as_array(g_pos_flat);
 
-    let fc3_rec_view = fc3_reciprocal.as_array();
-    let fc3_rec_flat = fc3_rec_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("fc3_reciprocal must be C-contiguous"))?;
+    let fc3_rec_flat = c_slice(&fc3_reciprocal, "fc3_reciprocal must be C-contiguous")?;
     let fc3_rec_cmplx = complex_readonly_as_cmplx(fc3_rec_flat);
 
-    let f0_view = freqs0.as_array();
-    let f0_slice = f0_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("freqs0 must be C-contiguous"))?;
-    let f1_view = freqs1.as_array();
-    let f1_slice = f1_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("freqs1 must be C-contiguous"))?;
-    let f2_view = freqs2.as_array();
-    let f2_slice = f2_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("freqs2 must be C-contiguous"))?;
+    let f0_slice = c_slice(&freqs0, "freqs0 must be C-contiguous")?;
+    let f1_slice = c_slice(&freqs1, "freqs1 must be C-contiguous")?;
+    let f2_slice = c_slice(&freqs2, "freqs2 must be C-contiguous")?;
 
-    let e0_view = eigvecs0.as_array();
-    let e0_flat = e0_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("eigvecs0 must be C-contiguous"))?;
+    let e0_flat = c_slice(&eigvecs0, "eigvecs0 must be C-contiguous")?;
     let e0_cmplx = complex_readonly_as_cmplx(e0_flat);
-    let e1_view = eigvecs1.as_array();
-    let e1_flat = e1_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("eigvecs1 must be C-contiguous"))?;
+    let e1_flat = c_slice(&eigvecs1, "eigvecs1 must be C-contiguous")?;
     let e1_cmplx = complex_readonly_as_cmplx(e1_flat);
-    let e2_view = eigvecs2.as_array();
-    let e2_flat = e2_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("eigvecs2 must be C-contiguous"))?;
+    let e2_flat = c_slice(&eigvecs2, "eigvecs2 must be C-contiguous")?;
     let e2_cmplx = complex_readonly_as_cmplx(e2_flat);
 
-    let masses_view = masses.as_array();
-    let masses_slice = masses_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("masses must be C-contiguous"))?;
+    let masses_slice = c_slice(&masses, "masses must be C-contiguous")?;
 
-    let band_view = band_indices.as_array();
-    let band_slice = band_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("band_indices must be C-contiguous"))?;
+    let band_slice = c_slice(&band_indices, "band_indices must be C-contiguous")?;
 
-    let out_slice = fc3_normal_squared
-        .as_slice_mut()
-        .map_err(|_| PyValueError::new_err("fc3_normal_squared must be C-contiguous"))?;
+    let out_slice = c_slice_mut(
+        &mut fc3_normal_squared,
+        "fc3_normal_squared must be C-contiguous",
+    )?;
 
     py.detach(|| {
         let mut scratch = reciprocal_to_normal::R2NScratch::new();
@@ -3062,38 +2753,24 @@ fn py_imag_self_energy_with_g<'py>(
         return Err(PyValueError::new_err("frequency_point_index out of range"));
     }
 
-    let fc3_view = fc3_normal_squared.as_array();
-    let fc3_slice = fc3_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("fc3_normal_squared must be C-contiguous"))?;
-    let freqs_view = frequencies.as_array();
-    let freqs_slice = freqs_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("frequencies must be C-contiguous"))?;
+    let fc3_slice = c_slice(
+        &fc3_normal_squared,
+        "fc3_normal_squared must be C-contiguous",
+    )?;
+    let freqs_slice = c_slice(&frequencies, "frequencies must be C-contiguous")?;
 
-    let triplets_view = triplets.as_array();
-    let triplets_flat = triplets_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("triplets must be C-contiguous"))?;
+    let triplets_flat = c_slice(&triplets, "triplets must be C-contiguous")?;
     let triplets_slice: &[[i64; 3]] = group_as_array(triplets_flat);
 
-    let weights_view = triplet_weights.as_array();
-    let weights_slice = weights_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("triplet_weights must be C-contiguous"))?;
+    let weights_slice = c_slice(&triplet_weights, "triplet_weights must be C-contiguous")?;
 
-    let g_view = g.as_array();
-    let g_slice = g_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("g must be C-contiguous"))?;
-    let g_zero_view = g_zero.as_array();
-    let g_zero_slice = g_zero_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("g_zero must be C-contiguous"))?;
+    let g_slice = c_slice(&g, "g must be C-contiguous")?;
+    let g_zero_slice = c_slice(&g_zero, "g_zero must be C-contiguous")?;
 
-    let ise_slice = imag_self_energy
-        .as_slice_mut()
-        .map_err(|_| PyValueError::new_err("imag_self_energy must be C-contiguous"))?;
+    let ise_slice = c_slice_mut(
+        &mut imag_self_energy,
+        "imag_self_energy must be C-contiguous",
+    )?;
 
     py.detach(|| {
         imag_self_energy::get_imag_self_energy_with_g(
@@ -3250,71 +2927,33 @@ fn py_interaction<'py>(
         [q_view[[2, 0]], q_view[[2, 1]], q_view[[2, 2]]],
     ];
 
-    let g_zero_view = g_zero.as_array();
-    let g_zero_slice = g_zero_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("g_zero must be C-contiguous"))?;
-    let freqs_view = frequencies.as_array();
-    let freqs_slice = freqs_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("frequencies must be C-contiguous"))?;
-    let eig_view = eigenvectors.as_array();
-    let eig_flat = eig_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("eigenvectors must be C-contiguous"))?;
+    let g_zero_slice = c_slice(&g_zero, "g_zero must be C-contiguous")?;
+    let freqs_slice = c_slice(&frequencies, "frequencies must be C-contiguous")?;
+    let eig_flat = c_slice(&eigenvectors, "eigenvectors must be C-contiguous")?;
     let eig_cmplx = complex_readonly_as_cmplx(eig_flat);
-    let triplets_view = triplets.as_array();
-    let triplets_flat = triplets_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("triplets must be C-contiguous"))?;
+    let triplets_flat = c_slice(&triplets, "triplets must be C-contiguous")?;
     let triplets_slice: &[[i64; 3]] = group_as_array(triplets_flat);
-    let addr_view = bz_grid_addresses.as_array();
-    let addr_flat = addr_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("bz_grid_addresses must be C-contiguous"))?;
+    let addr_flat = c_slice(&bz_grid_addresses, "bz_grid_addresses must be C-contiguous")?;
     let addr_slice: &[[i64; 3]] = group_as_array(addr_flat);
-    let fc3_view = fc3.as_array();
-    let fc3_slice = fc3_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("fc3 must be C-contiguous"))?;
-    let nonzero_view = fc3_nonzero_indices.as_array();
-    let nonzero_slice = nonzero_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("fc3_nonzero_indices must be C-contiguous"))?;
-    let svecs_view = svecs.as_array();
-    let svecs_flat = svecs_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("svecs must be C-contiguous"))?;
+    let fc3_slice = c_slice(&fc3, "fc3 must be C-contiguous")?;
+    let nonzero_slice = c_slice(
+        &fc3_nonzero_indices,
+        "fc3_nonzero_indices must be C-contiguous",
+    )?;
+    let svecs_flat = c_slice(&svecs, "svecs must be C-contiguous")?;
     let svecs_slice: &[[f64; 3]] = group_as_array(svecs_flat);
-    let multi_view = multiplicity.as_array();
-    let multi_flat = multi_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("multiplicity must be C-contiguous"))?;
+    let multi_flat = c_slice(&multiplicity, "multiplicity must be C-contiguous")?;
     let multi_slice: &[[i64; 2]] = group_as_array(multi_flat);
-    let masses_view = masses.as_array();
-    let masses_slice = masses_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("masses must be C-contiguous"))?;
-    let p2s_view = p2s_map.as_array();
-    let p2s_slice = p2s_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("p2s_map must be C-contiguous"))?;
-    let s2p_view = s2p_map.as_array();
-    let s2p_slice = s2p_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("s2p_map must be C-contiguous"))?;
-    let band_view = band_indices.as_array();
-    let band_slice = band_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("band_indices must be C-contiguous"))?;
-    let all_short_view = all_shortest.as_array();
-    let all_short_slice = all_short_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("all_shortest must be C-contiguous"))?;
+    let masses_slice = c_slice(&masses, "masses must be C-contiguous")?;
+    let p2s_slice = c_slice(&p2s_map, "p2s_map must be C-contiguous")?;
+    let s2p_slice = c_slice(&s2p_map, "s2p_map must be C-contiguous")?;
+    let band_slice = c_slice(&band_indices, "band_indices must be C-contiguous")?;
+    let all_short_slice = c_slice(&all_shortest, "all_shortest must be C-contiguous")?;
 
-    let out_slice = fc3_normal_squared
-        .as_slice_mut()
-        .map_err(|_| PyValueError::new_err("fc3_normal_squared must be C-contiguous"))?;
+    let out_slice = c_slice_mut(
+        &mut fc3_normal_squared,
+        "fc3_normal_squared must be C-contiguous",
+    )?;
 
     py.detach(|| {
         let atom_triplets = real_to_reciprocal::AtomTriplets {
@@ -3455,46 +3094,31 @@ fn py_detailed_imag_self_energy_with_g<'py>(
         ));
     }
 
-    let fc3_view = fc3_normal_squared.as_array();
-    let fc3_slice = fc3_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("fc3_normal_squared must be C-contiguous"))?;
-    let freqs_view = frequencies.as_array();
-    let freqs_slice = freqs_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("frequencies must be C-contiguous"))?;
-    let triplets_view = triplets.as_array();
-    let triplets_flat = triplets_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("triplets must be C-contiguous"))?;
+    let fc3_slice = c_slice(
+        &fc3_normal_squared,
+        "fc3_normal_squared must be C-contiguous",
+    )?;
+    let freqs_slice = c_slice(&frequencies, "frequencies must be C-contiguous")?;
+    let triplets_flat = c_slice(&triplets, "triplets must be C-contiguous")?;
     let triplets_slice: &[[i64; 3]] = group_as_array(triplets_flat);
-    let weights_view = triplet_weights.as_array();
-    let weights_slice = weights_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("triplet_weights must be C-contiguous"))?;
-    let addr_view = bz_grid_addresses.as_array();
-    let addr_flat = addr_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("bz_grid_addresses must be C-contiguous"))?;
+    let weights_slice = c_slice(&triplet_weights, "triplet_weights must be C-contiguous")?;
+    let addr_flat = c_slice(&bz_grid_addresses, "bz_grid_addresses must be C-contiguous")?;
     let addr_slice: &[[i64; 3]] = group_as_array(addr_flat);
-    let g_view = g.as_array();
-    let g_slice = g_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("g must be C-contiguous"))?;
-    let g_zero_view = g_zero.as_array();
-    let g_zero_slice = g_zero_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("g_zero must be C-contiguous"))?;
+    let g_slice = c_slice(&g, "g must be C-contiguous")?;
+    let g_zero_slice = c_slice(&g_zero, "g_zero must be C-contiguous")?;
 
-    let detailed_slice = detailed_imag_self_energy
-        .as_slice_mut()
-        .map_err(|_| PyValueError::new_err("detailed_imag_self_energy must be C-contiguous"))?;
-    let ise_n_slice = imag_self_energy_n
-        .as_slice_mut()
-        .map_err(|_| PyValueError::new_err("imag_self_energy_n must be C-contiguous"))?;
-    let ise_u_slice = imag_self_energy_u
-        .as_slice_mut()
-        .map_err(|_| PyValueError::new_err("imag_self_energy_u must be C-contiguous"))?;
+    let detailed_slice = c_slice_mut(
+        &mut detailed_imag_self_energy,
+        "detailed_imag_self_energy must be C-contiguous",
+    )?;
+    let ise_n_slice = c_slice_mut(
+        &mut imag_self_energy_n,
+        "imag_self_energy_n must be C-contiguous",
+    )?;
+    let ise_u_slice = c_slice_mut(
+        &mut imag_self_energy_u,
+        "imag_self_energy_u must be C-contiguous",
+    )?;
 
     py.detach(|| {
         imag_self_energy::get_detailed_imag_self_energy_with_g(
@@ -3666,79 +3290,32 @@ fn py_pp_collision<'py>(
         unsafe { std::slice::from_raw_parts(ptr, n) }
     };
 
-    let freqs_view = frequencies.as_array();
-    let freqs_slice = freqs_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("frequencies must be C-contiguous"))?;
-    let eig_view = eigenvectors.as_array();
-    let eig_flat = eig_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("eigenvectors must be C-contiguous"))?;
+    let freqs_slice = c_slice(&frequencies, "frequencies must be C-contiguous")?;
+    let eig_flat = c_slice(&eigenvectors, "eigenvectors must be C-contiguous")?;
     let eig_cmplx = complex_readonly_as_cmplx(eig_flat);
-    let triplets_view = triplets.as_array();
-    let triplets_flat = triplets_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("triplets must be C-contiguous"))?;
+    let triplets_flat = c_slice(&triplets, "triplets must be C-contiguous")?;
     let triplets_slice: &[[i64; 3]] = group_as_array(triplets_flat);
-    let weights_view = triplet_weights.as_array();
-    let weights_slice = weights_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("triplet_weights must be C-contiguous"))?;
-    let addr_view = bz_grid_addresses.as_array();
-    let addr_flat = addr_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("bz_grid_addresses must be C-contiguous"))?;
+    let weights_slice = c_slice(&triplet_weights, "triplet_weights must be C-contiguous")?;
+    let addr_flat = c_slice(&bz_grid_addresses, "bz_grid_addresses must be C-contiguous")?;
     let addr_slice: &[[i64; 3]] = group_as_array(addr_flat);
-    let bzmap_view = bz_map.as_array();
-    let bzmap_slice = bzmap_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("bz_map must be C-contiguous"))?;
-    let fc3_view = fc3.as_array();
-    let fc3_slice = fc3_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("fc3 must be C-contiguous"))?;
-    let nonzero_view = fc3_nonzero_indices.as_array();
-    let nonzero_slice = nonzero_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("fc3_nonzero_indices must be C-contiguous"))?;
-    let svecs_view = svecs.as_array();
-    let svecs_flat = svecs_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("svecs must be C-contiguous"))?;
+    let bzmap_slice = c_slice(&bz_map, "bz_map must be C-contiguous")?;
+    let fc3_slice = c_slice(&fc3, "fc3 must be C-contiguous")?;
+    let nonzero_slice = c_slice(
+        &fc3_nonzero_indices,
+        "fc3_nonzero_indices must be C-contiguous",
+    )?;
+    let svecs_flat = c_slice(&svecs, "svecs must be C-contiguous")?;
     let svecs_slice: &[[f64; 3]] = group_as_array(svecs_flat);
-    let multi_view = multiplicity.as_array();
-    let multi_flat = multi_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("multiplicity must be C-contiguous"))?;
+    let multi_flat = c_slice(&multiplicity, "multiplicity must be C-contiguous")?;
     let multi_slice: &[[i64; 2]] = group_as_array(multi_flat);
-    let masses_view = masses.as_array();
-    let masses_slice = masses_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("masses must be C-contiguous"))?;
-    let p2s_view = p2s_map.as_array();
-    let p2s_slice = p2s_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("p2s_map must be C-contiguous"))?;
-    let s2p_view = s2p_map.as_array();
-    let s2p_slice = s2p_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("s2p_map must be C-contiguous"))?;
-    let band_view = band_indices.as_array();
-    let band_slice = band_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("band_indices must be C-contiguous"))?;
-    let all_short_view = all_shortest.as_array();
-    let all_short_slice = all_short_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("all_shortest must be C-contiguous"))?;
-    let temps_view = temperatures_thz.as_array();
-    let temps_slice = temps_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("temperatures_thz must be C-contiguous"))?;
+    let masses_slice = c_slice(&masses, "masses must be C-contiguous")?;
+    let p2s_slice = c_slice(&p2s_map, "p2s_map must be C-contiguous")?;
+    let s2p_slice = c_slice(&s2p_map, "s2p_map must be C-contiguous")?;
+    let band_slice = c_slice(&band_indices, "band_indices must be C-contiguous")?;
+    let all_short_slice = c_slice(&all_shortest, "all_shortest must be C-contiguous")?;
+    let temps_slice = c_slice(&temperatures_thz, "temperatures_thz must be C-contiguous")?;
 
-    let out_slice = collisions
-        .as_slice_mut()
-        .map_err(|_| PyValueError::new_err("collisions must be C-contiguous"))?;
+    let out_slice = c_slice_mut(&mut collisions, "collisions must be C-contiguous")?;
 
     py.detach(|| {
         let atom_triplets = real_to_reciprocal::AtomTriplets {
@@ -3877,75 +3454,31 @@ fn py_pp_collision_with_sigma<'py>(
         unsafe { std::slice::from_raw_parts(ptr, n) }
     };
 
-    let freqs_view = frequencies.as_array();
-    let freqs_slice = freqs_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("frequencies must be C-contiguous"))?;
-    let eig_view = eigenvectors.as_array();
-    let eig_flat = eig_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("eigenvectors must be C-contiguous"))?;
+    let freqs_slice = c_slice(&frequencies, "frequencies must be C-contiguous")?;
+    let eig_flat = c_slice(&eigenvectors, "eigenvectors must be C-contiguous")?;
     let eig_cmplx = complex_readonly_as_cmplx(eig_flat);
-    let triplets_view = triplets.as_array();
-    let triplets_flat = triplets_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("triplets must be C-contiguous"))?;
+    let triplets_flat = c_slice(&triplets, "triplets must be C-contiguous")?;
     let triplets_slice: &[[i64; 3]] = group_as_array(triplets_flat);
-    let weights_view = triplet_weights.as_array();
-    let weights_slice = weights_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("triplet_weights must be C-contiguous"))?;
-    let addr_view = bz_grid_addresses.as_array();
-    let addr_flat = addr_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("bz_grid_addresses must be C-contiguous"))?;
+    let weights_slice = c_slice(&triplet_weights, "triplet_weights must be C-contiguous")?;
+    let addr_flat = c_slice(&bz_grid_addresses, "bz_grid_addresses must be C-contiguous")?;
     let addr_slice: &[[i64; 3]] = group_as_array(addr_flat);
-    let fc3_view = fc3.as_array();
-    let fc3_slice = fc3_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("fc3 must be C-contiguous"))?;
-    let nonzero_view = fc3_nonzero_indices.as_array();
-    let nonzero_slice = nonzero_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("fc3_nonzero_indices must be C-contiguous"))?;
-    let svecs_view = svecs.as_array();
-    let svecs_flat = svecs_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("svecs must be C-contiguous"))?;
+    let fc3_slice = c_slice(&fc3, "fc3 must be C-contiguous")?;
+    let nonzero_slice = c_slice(
+        &fc3_nonzero_indices,
+        "fc3_nonzero_indices must be C-contiguous",
+    )?;
+    let svecs_flat = c_slice(&svecs, "svecs must be C-contiguous")?;
     let svecs_slice: &[[f64; 3]] = group_as_array(svecs_flat);
-    let multi_view = multiplicity.as_array();
-    let multi_flat = multi_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("multiplicity must be C-contiguous"))?;
+    let multi_flat = c_slice(&multiplicity, "multiplicity must be C-contiguous")?;
     let multi_slice: &[[i64; 2]] = group_as_array(multi_flat);
-    let masses_view = masses.as_array();
-    let masses_slice = masses_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("masses must be C-contiguous"))?;
-    let p2s_view = p2s_map.as_array();
-    let p2s_slice = p2s_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("p2s_map must be C-contiguous"))?;
-    let s2p_view = s2p_map.as_array();
-    let s2p_slice = s2p_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("s2p_map must be C-contiguous"))?;
-    let band_view = band_indices.as_array();
-    let band_slice = band_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("band_indices must be C-contiguous"))?;
-    let all_short_view = all_shortest.as_array();
-    let all_short_slice = all_short_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("all_shortest must be C-contiguous"))?;
-    let temps_view = temperatures_thz.as_array();
-    let temps_slice = temps_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("temperatures_thz must be C-contiguous"))?;
+    let masses_slice = c_slice(&masses, "masses must be C-contiguous")?;
+    let p2s_slice = c_slice(&p2s_map, "p2s_map must be C-contiguous")?;
+    let s2p_slice = c_slice(&s2p_map, "s2p_map must be C-contiguous")?;
+    let band_slice = c_slice(&band_indices, "band_indices must be C-contiguous")?;
+    let all_short_slice = c_slice(&all_shortest, "all_shortest must be C-contiguous")?;
+    let temps_slice = c_slice(&temperatures_thz, "temperatures_thz must be C-contiguous")?;
 
-    let out_slice = collisions
-        .as_slice_mut()
-        .map_err(|_| PyValueError::new_err("collisions must be C-contiguous"))?;
+    let out_slice = c_slice_mut(&mut collisions, "collisions must be C-contiguous")?;
 
     py.detach(|| {
         let atom_triplets = real_to_reciprocal::AtomTriplets {
@@ -4129,78 +3662,30 @@ fn py_collision_at_grid_point<'py>(
         unsafe { std::slice::from_raw_parts(ptr, n) }
     };
 
-    let freqs_view = frequencies.as_array();
-    let freqs_slice = freqs_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("frequencies must be C-contiguous"))?;
-    let eig_view = eigenvectors.as_array();
-    let eig_flat = eig_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("eigenvectors must be C-contiguous"))?;
+    let freqs_slice = c_slice(&frequencies, "frequencies must be C-contiguous")?;
+    let eig_flat = c_slice(&eigenvectors, "eigenvectors must be C-contiguous")?;
     let eig_cmplx = complex_readonly_as_cmplx(eig_flat);
-    let addr_view = bz_grid_addresses.as_array();
-    let addr_flat = addr_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("bz_grid_addresses must be C-contiguous"))?;
+    let addr_flat = c_slice(&bz_grid_addresses, "bz_grid_addresses must be C-contiguous")?;
     let addr_slice: &[[i64; 3]] = group_as_array(addr_flat);
-    let bzmap_view = bz_map.as_array();
-    let bzmap_slice = bzmap_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("bz_map must be C-contiguous"))?;
-    let bzg2grg_view = bzg2grg.as_array();
-    let bzg2grg_slice = bzg2grg_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("bzg2grg must be C-contiguous"))?;
-    let fc3_view = fc3.as_array();
-    let fc3_slice = fc3_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("fc3 must be C-contiguous"))?;
-    let nonzero_view = fc3_nonzero_indices.as_array();
-    let nonzero_slice = nonzero_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("fc3_nonzero_indices must be C-contiguous"))?;
-    let svecs_view = svecs.as_array();
-    let svecs_flat = svecs_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("svecs must be C-contiguous"))?;
+    let bzmap_slice = c_slice(&bz_map, "bz_map must be C-contiguous")?;
+    let bzg2grg_slice = c_slice(&bzg2grg, "bzg2grg must be C-contiguous")?;
+    let fc3_slice = c_slice(&fc3, "fc3 must be C-contiguous")?;
+    let nonzero_slice = c_slice(
+        &fc3_nonzero_indices,
+        "fc3_nonzero_indices must be C-contiguous",
+    )?;
+    let svecs_flat = c_slice(&svecs, "svecs must be C-contiguous")?;
     let svecs_slice: &[[f64; 3]] = group_as_array(svecs_flat);
-    let multi_view = multiplicity.as_array();
-    let multi_flat = multi_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("multiplicity must be C-contiguous"))?;
+    let multi_flat = c_slice(&multiplicity, "multiplicity must be C-contiguous")?;
     let multi_slice: &[[i64; 2]] = group_as_array(multi_flat);
-    let masses_view = masses.as_array();
-    let masses_slice = masses_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("masses must be C-contiguous"))?;
-    let p2s_view = p2s_map.as_array();
-    let p2s_slice = p2s_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("p2s_map must be C-contiguous"))?;
-    let s2p_view = s2p_map.as_array();
-    let s2p_slice = s2p_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("s2p_map must be C-contiguous"))?;
-    let band_view = band_indices.as_array();
-    let band_slice = band_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("band_indices must be C-contiguous"))?;
-    let all_short_view = all_shortest.as_array();
-    let all_short_slice = all_short_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("all_shortest must be C-contiguous"))?;
-    let temps_view = temperatures_thz.as_array();
-    let temps_slice = temps_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("temperatures_thz must be C-contiguous"))?;
-    let sigmas_view = sigmas.as_array();
-    let sigmas_slice = sigmas_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("sigmas must be C-contiguous"))?;
-    let sigma_cutoffs_view = sigma_cutoffs.as_array();
-    let sigma_cutoffs_slice = sigma_cutoffs_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("sigma_cutoffs must be C-contiguous"))?;
+    let masses_slice = c_slice(&masses, "masses must be C-contiguous")?;
+    let p2s_slice = c_slice(&p2s_map, "p2s_map must be C-contiguous")?;
+    let s2p_slice = c_slice(&s2p_map, "s2p_map must be C-contiguous")?;
+    let band_slice = c_slice(&band_indices, "band_indices must be C-contiguous")?;
+    let all_short_slice = c_slice(&all_shortest, "all_shortest must be C-contiguous")?;
+    let temps_slice = c_slice(&temperatures_thz, "temperatures_thz must be C-contiguous")?;
+    let sigmas_slice = c_slice(&sigmas, "sigmas must be C-contiguous")?;
+    let sigma_cutoffs_slice = c_slice(&sigma_cutoffs, "sigma_cutoffs must be C-contiguous")?;
 
     // Triplet enumeration: ir_triplets_at_q (when mesh symmetry is in
     // effect) + bz_triplets_at_q, replicating get_triplets_at_q and
@@ -4273,9 +3758,7 @@ fn py_collision_at_grid_point<'py>(
     let weights_slice: &[i64] = &ir_weights;
 
     // Output buffer split into per-sigma chunks.
-    let out_slice = collisions
-        .as_slice_mut()
-        .map_err(|_| PyValueError::new_err("collisions must be C-contiguous"))?;
+    let out_slice = c_slice_mut(&mut collisions, "collisions must be C-contiguous")?;
     let per_sigma_len = if is_n_u {
         2 * num_temps * num_band0
     } else {
@@ -4497,82 +3980,31 @@ fn py_collision_at_grid_points_batched<'py>(
         unsafe { std::slice::from_raw_parts(ptr, n) }
     };
 
-    let freqs_view = frequencies.as_array();
-    let freqs_slice = freqs_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("frequencies must be C-contiguous"))?;
-    let eig_view = eigenvectors.as_array();
-    let eig_flat = eig_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("eigenvectors must be C-contiguous"))?;
+    let freqs_slice = c_slice(&frequencies, "frequencies must be C-contiguous")?;
+    let eig_flat = c_slice(&eigenvectors, "eigenvectors must be C-contiguous")?;
     let eig_cmplx = complex_readonly_as_cmplx(eig_flat);
-    let addr_view = bz_grid_addresses.as_array();
-    let addr_flat = addr_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("bz_grid_addresses must be C-contiguous"))?;
+    let addr_flat = c_slice(&bz_grid_addresses, "bz_grid_addresses must be C-contiguous")?;
     let addr_slice: &[[i64; 3]] = group_as_array(addr_flat);
-    let bzmap_view = bz_map.as_array();
-    let bzmap_slice = bzmap_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("bz_map must be C-contiguous"))?;
-    let bzg2grg_view = bzg2grg.as_array();
-    let bzg2grg_slice = bzg2grg_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("bzg2grg must be C-contiguous"))?;
-    let fc3_view = fc3.as_array();
-    let fc3_slice = fc3_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("fc3 must be C-contiguous"))?;
-    let nonzero_view = fc3_nonzero_indices.as_array();
-    let nonzero_slice = nonzero_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("fc3_nonzero_indices must be C-contiguous"))?;
-    let svecs_view = svecs.as_array();
-    let svecs_flat = svecs_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("svecs must be C-contiguous"))?;
+    let bzmap_slice = c_slice(&bz_map, "bz_map must be C-contiguous")?;
+    let bzg2grg_slice = c_slice(&bzg2grg, "bzg2grg must be C-contiguous")?;
+    let fc3_slice = c_slice(&fc3, "fc3 must be C-contiguous")?;
+    let nonzero_slice = c_slice(
+        &fc3_nonzero_indices,
+        "fc3_nonzero_indices must be C-contiguous",
+    )?;
+    let svecs_flat = c_slice(&svecs, "svecs must be C-contiguous")?;
     let svecs_slice: &[[f64; 3]] = group_as_array(svecs_flat);
-    let multi_view = multiplicity.as_array();
-    let multi_flat = multi_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("multiplicity must be C-contiguous"))?;
+    let multi_flat = c_slice(&multiplicity, "multiplicity must be C-contiguous")?;
     let multi_slice: &[[i64; 2]] = group_as_array(multi_flat);
-    let masses_view = masses.as_array();
-    let masses_slice = masses_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("masses must be C-contiguous"))?;
-    let p2s_view = p2s_map.as_array();
-    let p2s_slice = p2s_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("p2s_map must be C-contiguous"))?;
-    let s2p_view = s2p_map.as_array();
-    let s2p_slice = s2p_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("s2p_map must be C-contiguous"))?;
-    let band_view = band_indices.as_array();
-    let band_slice = band_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("band_indices must be C-contiguous"))?;
-    let all_short_view = all_shortest.as_array();
-    let all_short_slice = all_short_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("all_shortest must be C-contiguous"))?;
-    let temps_view = temperatures_thz.as_array();
-    let temps_slice = temps_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("temperatures_thz must be C-contiguous"))?;
-    let sigmas_view = sigmas.as_array();
-    let sigmas_slice = sigmas_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("sigmas must be C-contiguous"))?;
-    let sigma_cutoffs_view = sigma_cutoffs.as_array();
-    let sigma_cutoffs_slice = sigma_cutoffs_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("sigma_cutoffs must be C-contiguous"))?;
-    let grid_points_view = grid_points.as_array();
-    let grid_points_slice = grid_points_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("grid_points must be C-contiguous"))?;
+    let masses_slice = c_slice(&masses, "masses must be C-contiguous")?;
+    let p2s_slice = c_slice(&p2s_map, "p2s_map must be C-contiguous")?;
+    let s2p_slice = c_slice(&s2p_map, "s2p_map must be C-contiguous")?;
+    let band_slice = c_slice(&band_indices, "band_indices must be C-contiguous")?;
+    let all_short_slice = c_slice(&all_shortest, "all_shortest must be C-contiguous")?;
+    let temps_slice = c_slice(&temperatures_thz, "temperatures_thz must be C-contiguous")?;
+    let sigmas_slice = c_slice(&sigmas, "sigmas must be C-contiguous")?;
+    let sigma_cutoffs_slice = c_slice(&sigma_cutoffs, "sigma_cutoffs must be C-contiguous")?;
+    let grid_points_slice = c_slice(&grid_points, "grid_points must be C-contiguous")?;
 
     // Per-gp triplet enumeration: sequential, mirrors the single-gp path.
     let n_grg = (d3[0] as i64) * (d3[1] as i64) * (d3[2] as i64);
@@ -4650,9 +4082,7 @@ fn py_collision_at_grid_points_batched<'py>(
     let triplets_per_gp: Vec<&[[i64; 3]]> = triplets_owned.iter().map(|v| v.as_slice()).collect();
     let weights_per_gp: Vec<&[i64]> = weights_owned.iter().map(|v| v.as_slice()).collect();
 
-    let out_slice = collisions
-        .as_slice_mut()
-        .map_err(|_| PyValueError::new_err("collisions must be C-contiguous"))?;
+    let out_slice = c_slice_mut(&mut collisions, "collisions must be C-contiguous")?;
     let per_sigma_len = if is_n_u {
         2 * num_temps * num_band0
     } else {
@@ -4809,40 +4239,20 @@ fn py_isotope_strength<'py>(
         return Err(PyValueError::new_err("grid_point out of range"));
     }
 
-    let ir_view = ir_grid_points.as_array();
-    let ir_slice = ir_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("ir_grid_points must be C-contiguous"))?;
-    let weights_view = weights.as_array();
-    let weights_slice = weights_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("weights must be C-contiguous"))?;
-    let mv_view = mass_variances.as_array();
-    let mv_slice = mv_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("mass_variances must be C-contiguous"))?;
-    let freqs_view = frequencies.as_array();
-    let freqs_slice = freqs_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("frequencies must be C-contiguous"))?;
-    let eig_view = eigenvectors.as_array();
-    let eig_flat = eig_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("eigenvectors must be C-contiguous"))?;
+    let ir_slice = c_slice(&ir_grid_points, "ir_grid_points must be C-contiguous")?;
+    let weights_slice = c_slice(&weights, "weights must be C-contiguous")?;
+    let mv_slice = c_slice(&mass_variances, "mass_variances must be C-contiguous")?;
+    let freqs_slice = c_slice(&frequencies, "frequencies must be C-contiguous")?;
+    let eig_flat = c_slice(&eigenvectors, "eigenvectors must be C-contiguous")?;
     let complex_readonly_as_cmplx = |s: &[Complex64]| -> &[Cmplx] {
         let n = s.len();
         let ptr = s.as_ptr() as *const Cmplx;
         unsafe { std::slice::from_raw_parts(ptr, n) }
     };
     let eig_slice = complex_readonly_as_cmplx(eig_flat);
-    let bi_view = band_indices.as_array();
-    let bi_slice = bi_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("band_indices must be C-contiguous"))?;
+    let bi_slice = c_slice(&band_indices, "band_indices must be C-contiguous")?;
 
-    let gamma_slice = gamma
-        .as_slice_mut()
-        .map_err(|_| PyValueError::new_err("gamma must be C-contiguous"))?;
+    let gamma_slice = c_slice_mut(&mut gamma, "gamma must be C-contiguous")?;
 
     py.detach(|| {
         isotope::isotope_strength(
@@ -4916,44 +4326,24 @@ fn py_thm_isotope_strength<'py>(
         return Err(PyValueError::new_err("grid_point out of range"));
     }
 
-    let ir_view = ir_grid_points.as_array();
-    let ir_slice = ir_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("ir_grid_points must be C-contiguous"))?;
-    let weights_view = weights.as_array();
-    let weights_slice = weights_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("weights must be C-contiguous"))?;
-    let mv_view = mass_variances.as_array();
-    let mv_slice = mv_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("mass_variances must be C-contiguous"))?;
-    let freqs_view = frequencies.as_array();
-    let freqs_slice = freqs_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("frequencies must be C-contiguous"))?;
-    let eig_view = eigenvectors.as_array();
-    let eig_flat = eig_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("eigenvectors must be C-contiguous"))?;
+    let ir_slice = c_slice(&ir_grid_points, "ir_grid_points must be C-contiguous")?;
+    let weights_slice = c_slice(&weights, "weights must be C-contiguous")?;
+    let mv_slice = c_slice(&mass_variances, "mass_variances must be C-contiguous")?;
+    let freqs_slice = c_slice(&frequencies, "frequencies must be C-contiguous")?;
+    let eig_flat = c_slice(&eigenvectors, "eigenvectors must be C-contiguous")?;
     let complex_readonly_as_cmplx = |s: &[Complex64]| -> &[Cmplx] {
         let n = s.len();
         let ptr = s.as_ptr() as *const Cmplx;
         unsafe { std::slice::from_raw_parts(ptr, n) }
     };
     let eig_slice = complex_readonly_as_cmplx(eig_flat);
-    let bi_view = band_indices.as_array();
-    let bi_slice = bi_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("band_indices must be C-contiguous"))?;
-    let iw_view = integration_weights.as_array();
-    let iw_slice = iw_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("integration_weights must be C-contiguous"))?;
+    let bi_slice = c_slice(&band_indices, "band_indices must be C-contiguous")?;
+    let iw_slice = c_slice(
+        &integration_weights,
+        "integration_weights must be C-contiguous",
+    )?;
 
-    let gamma_slice = gamma
-        .as_slice_mut()
-        .map_err(|_| PyValueError::new_err("gamma must be C-contiguous"))?;
+    let gamma_slice = c_slice_mut(&mut gamma, "gamma must be C-contiguous")?;
 
     py.detach(|| {
         isotope::thm_isotope_strength(
@@ -5041,30 +4431,19 @@ fn py_real_self_energy_at_bands<'py>(
         ));
     }
 
-    let fc3_view = fc3_normal_squared.as_array();
-    let fc3_slice = fc3_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("fc3_normal_squared must be C-contiguous"))?;
-    let triplets_view = triplets.as_array();
-    let triplets_flat = triplets_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("triplets must be C-contiguous"))?;
+    let fc3_slice = c_slice(
+        &fc3_normal_squared,
+        "fc3_normal_squared must be C-contiguous",
+    )?;
+    let triplets_flat = c_slice(&triplets, "triplets must be C-contiguous")?;
     let triplets_slice: &[[i64; 3]] = group_as_array(triplets_flat);
-    let weights_view = triplet_weights.as_array();
-    let weights_slice = weights_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("triplet_weights must be C-contiguous"))?;
-    let freqs_view = frequencies.as_array();
-    let freqs_slice = freqs_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("frequencies must be C-contiguous"))?;
-    let bi_view = band_indices.as_array();
-    let bi_slice = bi_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("band_indices must be C-contiguous"))?;
-    let rse_slice = real_self_energy
-        .as_slice_mut()
-        .map_err(|_| PyValueError::new_err("real_self_energy must be C-contiguous"))?;
+    let weights_slice = c_slice(&triplet_weights, "triplet_weights must be C-contiguous")?;
+    let freqs_slice = c_slice(&frequencies, "frequencies must be C-contiguous")?;
+    let bi_slice = c_slice(&band_indices, "band_indices must be C-contiguous")?;
+    let rse_slice = c_slice_mut(
+        &mut real_self_energy,
+        "real_self_energy must be C-contiguous",
+    )?;
 
     py.detach(|| {
         real_self_energy::real_self_energy_at_bands(
@@ -5147,26 +4526,18 @@ fn py_real_self_energy_at_frequency_point<'py>(
         ));
     }
 
-    let fc3_view = fc3_normal_squared.as_array();
-    let fc3_slice = fc3_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("fc3_normal_squared must be C-contiguous"))?;
-    let triplets_view = triplets.as_array();
-    let triplets_flat = triplets_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("triplets must be C-contiguous"))?;
+    let fc3_slice = c_slice(
+        &fc3_normal_squared,
+        "fc3_normal_squared must be C-contiguous",
+    )?;
+    let triplets_flat = c_slice(&triplets, "triplets must be C-contiguous")?;
     let triplets_slice: &[[i64; 3]] = group_as_array(triplets_flat);
-    let weights_view = triplet_weights.as_array();
-    let weights_slice = weights_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("triplet_weights must be C-contiguous"))?;
-    let freqs_view = frequencies.as_array();
-    let freqs_slice = freqs_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("frequencies must be C-contiguous"))?;
-    let rse_slice = real_self_energy
-        .as_slice_mut()
-        .map_err(|_| PyValueError::new_err("real_self_energy must be C-contiguous"))?;
+    let weights_slice = c_slice(&triplet_weights, "triplet_weights must be C-contiguous")?;
+    let freqs_slice = c_slice(&frequencies, "frequencies must be C-contiguous")?;
+    let rse_slice = c_slice_mut(
+        &mut real_self_energy,
+        "real_self_energy must be C-contiguous",
+    )?;
 
     py.detach(|| {
         real_self_energy::real_self_energy_at_frequency_point(
@@ -5281,44 +4652,27 @@ fn py_collision_matrix<'py>(
         ));
     }
 
-    let fc3_view = fc3_normal_squared.as_array();
-    let fc3_slice = fc3_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("fc3_normal_squared must be C-contiguous"))?;
-    let freqs_view = frequencies.as_array();
-    let freqs_slice = freqs_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("frequencies must be C-contiguous"))?;
-    let g_view = g.as_array();
-    let g_flat = g_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("g must be C-contiguous"))?;
+    let fc3_slice = c_slice(
+        &fc3_normal_squared,
+        "fc3_normal_squared must be C-contiguous",
+    )?;
+    let freqs_slice = c_slice(&frequencies, "frequencies must be C-contiguous")?;
+    let g_flat = c_slice(&g, "g must be C-contiguous")?;
     let g_offset = 2 * num_triplets * num_band0 * num_band * num_band;
     let g_slab = &g_flat[g_offset..];
-    let triplets_view = triplets.as_array();
-    let triplets_flat = triplets_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("triplets must be C-contiguous"))?;
+    let triplets_flat = c_slice(&triplets, "triplets must be C-contiguous")?;
     let triplets_slice: &[[i64; 3]] = group_as_array(triplets_flat);
-    let tm_view = triplets_map.as_array();
-    let tm_slice = tm_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("triplets_map must be C-contiguous"))?;
-    let mq_view = map_q.as_array();
-    let mq_slice = mq_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("map_q must be C-contiguous"))?;
-    let rgp_view = rot_grid_points.as_array();
-    let rgp_slice = rgp_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("rot_grid_points must be C-contiguous"))?;
-    let rc_view = rotations_cartesian.as_array();
-    let rc_slice = rc_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("rotations_cartesian must be C-contiguous"))?;
-    let cm_slice = collision_matrix
-        .as_slice_mut()
-        .map_err(|_| PyValueError::new_err("collision_matrix must be C-contiguous"))?;
+    let tm_slice = c_slice(&triplets_map, "triplets_map must be C-contiguous")?;
+    let mq_slice = c_slice(&map_q, "map_q must be C-contiguous")?;
+    let rgp_slice = c_slice(&rot_grid_points, "rot_grid_points must be C-contiguous")?;
+    let rc_slice = c_slice(
+        &rotations_cartesian,
+        "rotations_cartesian must be C-contiguous",
+    )?;
+    let cm_slice = c_slice_mut(
+        &mut collision_matrix,
+        "collision_matrix must be C-contiguous",
+    )?;
 
     py.detach(|| {
         collision_matrix::collision_matrix(
@@ -5419,36 +4773,22 @@ fn py_reducible_collision_matrix<'py>(
         ));
     }
 
-    let fc3_view = fc3_normal_squared.as_array();
-    let fc3_slice = fc3_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("fc3_normal_squared must be C-contiguous"))?;
-    let freqs_view = frequencies.as_array();
-    let freqs_slice = freqs_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("frequencies must be C-contiguous"))?;
-    let g_view = g.as_array();
-    let g_flat = g_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("g must be C-contiguous"))?;
+    let fc3_slice = c_slice(
+        &fc3_normal_squared,
+        "fc3_normal_squared must be C-contiguous",
+    )?;
+    let freqs_slice = c_slice(&frequencies, "frequencies must be C-contiguous")?;
+    let g_flat = c_slice(&g, "g must be C-contiguous")?;
     let g_offset = 2 * num_triplets * num_band0 * num_band * num_band;
     let g_slab = &g_flat[g_offset..];
-    let triplets_view = triplets.as_array();
-    let triplets_flat = triplets_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("triplets must be C-contiguous"))?;
+    let triplets_flat = c_slice(&triplets, "triplets must be C-contiguous")?;
     let triplets_slice: &[[i64; 3]] = group_as_array(triplets_flat);
-    let tm_view = triplets_map.as_array();
-    let tm_slice = tm_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("triplets_map must be C-contiguous"))?;
-    let mq_view = map_q.as_array();
-    let mq_slice = mq_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("map_q must be C-contiguous"))?;
-    let cm_slice = collision_matrix
-        .as_slice_mut()
-        .map_err(|_| PyValueError::new_err("collision_matrix must be C-contiguous"))?;
+    let tm_slice = c_slice(&triplets_map, "triplets_map must be C-contiguous")?;
+    let mq_slice = c_slice(&map_q, "map_q must be C-contiguous")?;
+    let cm_slice = c_slice_mut(
+        &mut collision_matrix,
+        "collision_matrix must be C-contiguous",
+    )?;
 
     py.detach(|| {
         collision_matrix::reducible_collision_matrix(
@@ -5515,9 +4855,10 @@ fn py_symmetrize_collision_matrix<'py>(
         }
     };
 
-    let cm_slice = collision_matrix
-        .as_slice_mut()
-        .map_err(|_| PyValueError::new_err("collision_matrix must be C-contiguous"))?;
+    let cm_slice = c_slice_mut(
+        &mut collision_matrix,
+        "collision_matrix must be C-contiguous",
+    )?;
 
     py.detach(|| {
         collision_matrix::symmetrize_collision_matrix(cm_slice, num_column, num_temp, num_sigma);
@@ -5560,17 +4901,12 @@ fn py_expand_collision_matrix<'py>(
     }
     let num_rot = rot_shape[0];
 
-    let ir_view = ir_grid_points.as_array();
-    let ir_slice = ir_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("ir_grid_points must be C-contiguous"))?;
-    let rot_view = rot_grid_points.as_array();
-    let rot_slice = rot_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("rot_grid_points must be C-contiguous"))?;
-    let cm_slice = collision_matrix
-        .as_slice_mut()
-        .map_err(|_| PyValueError::new_err("collision_matrix must be C-contiguous"))?;
+    let ir_slice = c_slice(&ir_grid_points, "ir_grid_points must be C-contiguous")?;
+    let rot_slice = c_slice(&rot_grid_points, "rot_grid_points must be C-contiguous")?;
+    let cm_slice = c_slice_mut(
+        &mut collision_matrix,
+        "collision_matrix must be C-contiguous",
+    )?;
 
     py.detach(|| {
         collision_matrix::expand_collision_matrix(
@@ -5634,17 +4970,9 @@ fn py_distribute_fc3<'py>(
         return Err(PyValueError::new_err("source out of range"));
     }
 
-    let atom_view = atom_mapping.as_array();
-    let atom_slice = atom_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("atom_mapping must be C-contiguous"))?;
-    let rot_view = rot_cart_inv.as_array();
-    let rot_slice = rot_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("rot_cart_inv must be C-contiguous"))?;
-    let fc3_slice = fc3
-        .as_slice_mut()
-        .map_err(|_| PyValueError::new_err("fc3 must be C-contiguous"))?;
+    let atom_slice = c_slice(&atom_mapping, "atom_mapping must be C-contiguous")?;
+    let rot_slice = c_slice(&rot_cart_inv, "rot_cart_inv must be C-contiguous")?;
+    let fc3_slice = c_slice_mut(&mut fc3, "fc3 must be C-contiguous")?;
 
     py.detach(|| {
         fc3::distribute_fc3(
@@ -5677,9 +5005,7 @@ fn py_permutation_symmetry_fc3<'py>(
             "fc3 must have shape (num_atom, num_atom, num_atom, 3, 3, 3)",
         ));
     }
-    let fc3_slice = fc3
-        .as_slice_mut()
-        .map_err(|_| PyValueError::new_err("fc3 must be C-contiguous"))?;
+    let fc3_slice = c_slice_mut(&mut fc3, "fc3 must be C-contiguous")?;
 
     py.detach(|| {
         fc3::set_permutation_symmetry_fc3(fc3_slice, num_atom);
@@ -5721,25 +5047,11 @@ fn py_transpose_compact_fc3<'py>(
         ));
     }
 
-    let perms_view = permutations.as_array();
-    let perms_slice = perms_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("permutations must be C-contiguous"))?;
-    let s2pp_view = s2pp_map.as_array();
-    let s2pp_slice = s2pp_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("s2pp_map must be C-contiguous"))?;
-    let p2s_view = p2s_map.as_array();
-    let p2s_slice = p2s_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("p2s_map must be C-contiguous"))?;
-    let nsym_view = nsym_list.as_array();
-    let nsym_slice = nsym_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("nsym_list must be C-contiguous"))?;
-    let fc3_slice = fc3
-        .as_slice_mut()
-        .map_err(|_| PyValueError::new_err("fc3 must be C-contiguous"))?;
+    let perms_slice = c_slice(&permutations, "permutations must be C-contiguous")?;
+    let s2pp_slice = c_slice(&s2pp_map, "s2pp_map must be C-contiguous")?;
+    let p2s_slice = c_slice(&p2s_map, "p2s_map must be C-contiguous")?;
+    let nsym_slice = c_slice(&nsym_list, "nsym_list must be C-contiguous")?;
+    let fc3_slice = c_slice_mut(&mut fc3, "fc3 must be C-contiguous")?;
 
     py.detach(|| {
         fc3::transpose_compact_fc3(
@@ -5789,25 +5101,11 @@ fn py_permutation_symmetry_compact_fc3<'py>(
         ));
     }
 
-    let perms_view = permutations.as_array();
-    let perms_slice = perms_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("permutations must be C-contiguous"))?;
-    let s2pp_view = s2pp_map.as_array();
-    let s2pp_slice = s2pp_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("s2pp_map must be C-contiguous"))?;
-    let p2s_view = p2s_map.as_array();
-    let p2s_slice = p2s_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("p2s_map must be C-contiguous"))?;
-    let nsym_view = nsym_list.as_array();
-    let nsym_slice = nsym_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("nsym_list must be C-contiguous"))?;
-    let fc3_slice = fc3
-        .as_slice_mut()
-        .map_err(|_| PyValueError::new_err("fc3 must be C-contiguous"))?;
+    let perms_slice = c_slice(&permutations, "permutations must be C-contiguous")?;
+    let s2pp_slice = c_slice(&s2pp_map, "s2pp_map must be C-contiguous")?;
+    let p2s_slice = c_slice(&p2s_map, "p2s_map must be C-contiguous")?;
+    let nsym_slice = c_slice(&nsym_list, "nsym_list must be C-contiguous")?;
+    let fc3_slice = c_slice_mut(&mut fc3, "fc3 must be C-contiguous")?;
 
     py.detach(|| {
         fc3::set_permutation_symmetry_compact_fc3(
@@ -5845,9 +5143,7 @@ fn py_permutation_symmetry_fc4<'py>(
             "fc4 must have shape (num_atom, num_atom, num_atom, num_atom, 3, 3, 3, 3)",
         ));
     }
-    let fc4_slice = fc4
-        .as_slice_mut()
-        .map_err(|_| PyValueError::new_err("fc4 must be C-contiguous"))?;
+    let fc4_slice = c_slice_mut(&mut fc4, "fc4 must be C-contiguous")?;
     py.detach(|| {
         fc4::set_permutation_symmetry_fc4(fc4_slice, num_atom);
     });
@@ -5892,25 +5188,11 @@ fn py_permutation_symmetry_compact_fc4<'py>(
         ));
     }
 
-    let perms_view = permutations.as_array();
-    let perms_slice = perms_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("permutations must be C-contiguous"))?;
-    let s2pp_view = s2pp_map.as_array();
-    let s2pp_slice = s2pp_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("s2pp_map must be C-contiguous"))?;
-    let p2s_view = p2s_map.as_array();
-    let p2s_slice = p2s_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("p2s_map must be C-contiguous"))?;
-    let nsym_view = nsym_list.as_array();
-    let nsym_slice = nsym_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("nsym_list must be C-contiguous"))?;
-    let fc4_slice = fc4
-        .as_slice_mut()
-        .map_err(|_| PyValueError::new_err("fc4 must be C-contiguous"))?;
+    let perms_slice = c_slice(&permutations, "permutations must be C-contiguous")?;
+    let s2pp_slice = c_slice(&s2pp_map, "s2pp_map must be C-contiguous")?;
+    let p2s_slice = c_slice(&p2s_map, "p2s_map must be C-contiguous")?;
+    let nsym_slice = c_slice(&nsym_list, "nsym_list must be C-contiguous")?;
+    let fc4_slice = c_slice_mut(&mut fc4, "fc4 must be C-contiguous")?;
 
     py.detach(|| {
         fc4::set_permutation_symmetry_compact_fc4(
@@ -5965,25 +5247,11 @@ fn py_transpose_compact_fc4<'py>(
         ));
     }
 
-    let perms_view = permutations.as_array();
-    let perms_slice = perms_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("permutations must be C-contiguous"))?;
-    let s2pp_view = s2pp_map.as_array();
-    let s2pp_slice = s2pp_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("s2pp_map must be C-contiguous"))?;
-    let p2s_view = p2s_map.as_array();
-    let p2s_slice = p2s_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("p2s_map must be C-contiguous"))?;
-    let nsym_view = nsym_list.as_array();
-    let nsym_slice = nsym_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("nsym_list must be C-contiguous"))?;
-    let fc4_slice = fc4
-        .as_slice_mut()
-        .map_err(|_| PyValueError::new_err("fc4 must be C-contiguous"))?;
+    let perms_slice = c_slice(&permutations, "permutations must be C-contiguous")?;
+    let s2pp_slice = c_slice(&s2pp_map, "s2pp_map must be C-contiguous")?;
+    let p2s_slice = c_slice(&p2s_map, "p2s_map must be C-contiguous")?;
+    let nsym_slice = c_slice(&nsym_list, "nsym_list must be C-contiguous")?;
+    let fc4_slice = c_slice_mut(&mut fc4, "fc4 must be C-contiguous")?;
 
     py.detach(|| {
         fc4::transpose_compact_fc4(
@@ -6041,17 +5309,9 @@ fn py_distribute_fc4<'py>(
         return Err(PyValueError::new_err("source out of range"));
     }
 
-    let atom_view = atom_mapping.as_array();
-    let atom_slice = atom_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("atom_mapping must be C-contiguous"))?;
-    let rot_view = rot_cart_inv.as_array();
-    let rot_slice = rot_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("rot_cart_inv must be C-contiguous"))?;
-    let fc4_slice = fc4
-        .as_slice_mut()
-        .map_err(|_| PyValueError::new_err("fc4 must be C-contiguous"))?;
+    let atom_slice = c_slice(&atom_mapping, "atom_mapping must be C-contiguous")?;
+    let rot_slice = c_slice(&rot_cart_inv, "rot_cart_inv must be C-contiguous")?;
+    let fc4_slice = c_slice_mut(&mut fc4, "fc4 must be C-contiguous")?;
 
     py.detach(|| {
         fc4::distribute_fc4(
@@ -6125,25 +5385,11 @@ fn py_rotate_delta_fc3s<'py>(
         ));
     }
 
-    let df_view = delta_fc3s.as_array();
-    let df_slice = df_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("delta_fc3s must be C-contiguous"))?;
-    let inv_view = inv_u.as_array();
-    let inv_slice = inv_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("inv_u must be C-contiguous"))?;
-    let ss_view = site_sym_cart.as_array();
-    let ss_slice = ss_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("site_sym_cart must be C-contiguous"))?;
-    let rm_view = rot_map_syms.as_array();
-    let rm_slice = rm_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("rot_map_syms must be C-contiguous"))?;
-    let fc4_slice = fc4
-        .as_slice_mut()
-        .map_err(|_| PyValueError::new_err("fc4 must be C-contiguous"))?;
+    let df_slice = c_slice(&delta_fc3s, "delta_fc3s must be C-contiguous")?;
+    let inv_slice = c_slice(&inv_u, "inv_u must be C-contiguous")?;
+    let ss_slice = c_slice(&site_sym_cart, "site_sym_cart must be C-contiguous")?;
+    let rm_slice = c_slice(&rot_map_syms, "rot_map_syms must be C-contiguous")?;
+    let fc4_slice = c_slice_mut(&mut fc4, "fc4 must be C-contiguous")?;
 
     py.detach(|| {
         fc4::rotate_delta_fc3s(
@@ -6208,33 +5454,13 @@ fn py_real_to_reciprocal_fc4<'py>(
         [q_view[[2, 0]], q_view[[2, 1]], q_view[[2, 2]]],
         [q_view[[3, 0]], q_view[[3, 1]], q_view[[3, 2]]],
     ];
-    let svecs_view = svecs.as_array();
-    let svecs_slice: &[[f64; 3]] = group_as_array(
-        svecs_view
-            .as_slice()
-            .ok_or_else(|| PyValueError::new_err("svecs must be C-contiguous"))?,
-    );
-    let multi_view = multiplicity.as_array();
-    let multi_slice: &[[i64; 2]] = group_as_array(
-        multi_view
-            .as_slice()
-            .ok_or_else(|| PyValueError::new_err("multiplicity must be C-contiguous"))?,
-    );
-    let p2s_view = p2s_map.as_array();
-    let p2s_slice = p2s_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("p2s_map must be C-contiguous"))?;
-    let s2p_view = s2p_map.as_array();
-    let s2p_slice = s2p_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("s2p_map must be C-contiguous"))?;
-    let fc4_view = fc4.as_array();
-    let fc4_slice = fc4_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("fc4 must be C-contiguous"))?;
-    let rec_slice = fc4_reciprocal
-        .as_slice_mut()
-        .map_err(|_| PyValueError::new_err("fc4_reciprocal must be C-contiguous"))?;
+    let svecs_slice: &[[f64; 3]] = group_as_array(c_slice(&svecs, "svecs must be C-contiguous")?);
+    let multi_slice: &[[i64; 2]] =
+        group_as_array(c_slice(&multiplicity, "multiplicity must be C-contiguous")?);
+    let p2s_slice = c_slice(&p2s_map, "p2s_map must be C-contiguous")?;
+    let s2p_slice = c_slice(&s2p_map, "s2p_map must be C-contiguous")?;
+    let fc4_slice = c_slice(&fc4, "fc4 must be C-contiguous")?;
+    let rec_slice = c_slice_mut(&mut fc4_reciprocal, "fc4_reciprocal must be C-contiguous")?;
     let rec_cmplx = complex_as_cmplx_mut(rec_slice);
 
     py.detach(|| {
@@ -6289,35 +5515,15 @@ fn py_reciprocal_to_normal_fc4<'py>(
         ));
     }
 
-    let rec_view = fc4_reciprocal.as_array();
-    let rec_slice = complex_as_cmplx(
-        rec_view
-            .as_slice()
-            .ok_or_else(|| PyValueError::new_err("fc4_reciprocal must be C-contiguous"))?,
-    );
-    let e1_view = e1.as_array();
-    let e1_slice = complex_as_cmplx(
-        e1_view
-            .as_slice()
-            .ok_or_else(|| PyValueError::new_err("e1 must be C-contiguous"))?,
-    );
-    let e2_view = e2.as_array();
-    let e2_slice = complex_as_cmplx(
-        e2_view
-            .as_slice()
-            .ok_or_else(|| PyValueError::new_err("e2 must be C-contiguous"))?,
-    );
-    let f2_view = f2.as_array();
-    let f2_slice = f2_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("f2 must be C-contiguous"))?;
-    let m_view = inv_sqrt_masses.as_array();
-    let m_slice = m_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("inv_sqrt_masses must be C-contiguous"))?;
-    let normal_slice = fc4_normal
-        .as_slice_mut()
-        .map_err(|_| PyValueError::new_err("fc4_normal must be C-contiguous"))?;
+    let rec_slice = complex_as_cmplx(c_slice(
+        &fc4_reciprocal,
+        "fc4_reciprocal must be C-contiguous",
+    )?);
+    let e1_slice = complex_as_cmplx(c_slice(&e1, "e1 must be C-contiguous")?);
+    let e2_slice = complex_as_cmplx(c_slice(&e2, "e2 must be C-contiguous")?);
+    let f2_slice = c_slice(&f2, "f2 must be C-contiguous")?;
+    let m_slice = c_slice(&inv_sqrt_masses, "inv_sqrt_masses must be C-contiguous")?;
+    let normal_slice = c_slice_mut(&mut fc4_normal, "fc4_normal must be C-contiguous")?;
     let normal_cmplx = complex_as_cmplx_mut(normal_slice);
 
     py.detach(|| {
@@ -6379,25 +5585,11 @@ fn py_rotate_delta_fc2s<'py>(
         ));
     }
 
-    let df_view = delta_fc2s.as_array();
-    let df_slice = df_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("delta_fc2s must be C-contiguous"))?;
-    let inv_view = inv_u.as_array();
-    let inv_slice = inv_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("inv_u must be C-contiguous"))?;
-    let ss_view = site_sym_cart.as_array();
-    let ss_slice = ss_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("site_sym_cart must be C-contiguous"))?;
-    let rm_view = rot_map_syms.as_array();
-    let rm_slice = rm_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("rot_map_syms must be C-contiguous"))?;
-    let fc3_slice = fc3
-        .as_slice_mut()
-        .map_err(|_| PyValueError::new_err("fc3 must be C-contiguous"))?;
+    let df_slice = c_slice(&delta_fc2s, "delta_fc2s must be C-contiguous")?;
+    let inv_slice = c_slice(&inv_u, "inv_u must be C-contiguous")?;
+    let ss_slice = c_slice(&site_sym_cart, "site_sym_cart must be C-contiguous")?;
+    let rm_slice = c_slice(&rot_map_syms, "rot_map_syms must be C-contiguous")?;
+    let fc3_slice = c_slice_mut(&mut fc3, "fc3 must be C-contiguous")?;
 
     py.detach(|| {
         fc3::rotate_delta_fc2s(
@@ -6429,17 +5621,12 @@ fn py_neighboring_grid_points<'py>(
     let rga = addresses_i(&relative_grid_address)?;
     let adrs = addresses_i(&bz_grid_addresses)?;
     let d = vec3_i(&d_diag)?;
-    let gp_view = grid_points.as_array();
-    let gp_slice = gp_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("grid_points must be C-contiguous"))?;
-    let bzmap_view = bz_map.as_array();
-    let bzmap_slice = bzmap_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("bz_map must be C-contiguous"))?;
-    let out = relative_grid_points
-        .as_slice_mut()
-        .map_err(|_| PyValueError::new_err("relative_grid_points must be C-contiguous"))?;
+    let gp_slice = c_slice(&grid_points, "grid_points must be C-contiguous")?;
+    let bzmap_slice = c_slice(&bz_map, "bz_map must be C-contiguous")?;
+    let out = c_slice_mut(
+        &mut relative_grid_points,
+        "relative_grid_points must be C-contiguous",
+    )?;
     if out.len() != gp_slice.len() * rga.len() {
         return Err(PyValueError::new_err(
             "relative_grid_points must have length num_grid_points * num_relative_grid_address",
@@ -6486,27 +5673,12 @@ fn py_integration_weights_at_grid_points<'py>(
     let adrs = addresses_i(&bz_grid_addresses)?;
     let d = vec3_i(&d_diag)?;
 
-    let fp_view = frequency_points.as_array();
-    let fp_slice = fp_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("frequency_points must be C-contiguous"))?;
-    let gp_view = grid_points.as_array();
-    let gp_slice = gp_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("grid_points must be C-contiguous"))?;
-    let fr_view = frequencies.as_array();
-    let fr_slice = fr_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("frequencies must be C-contiguous"))?;
+    let fp_slice = c_slice(&frequency_points, "frequency_points must be C-contiguous")?;
+    let gp_slice = c_slice(&grid_points, "grid_points must be C-contiguous")?;
+    let fr_slice = c_slice(&frequencies, "frequencies must be C-contiguous")?;
     let num_band = frequencies.shape()[1];
-    let bzmap_view = bz_map.as_array();
-    let bzmap_slice = bzmap_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("bz_map must be C-contiguous"))?;
-    let gp2ir_view = gp2irgp_map.as_array();
-    let gp2ir_slice = gp2ir_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("gp2irgp_map must be C-contiguous"))?;
+    let bzmap_slice = c_slice(&bz_map, "bz_map must be C-contiguous")?;
+    let gp2ir_slice = c_slice(&gp2irgp_map, "gp2irgp_map must be C-contiguous")?;
 
     let iw_shape = iw.shape();
     if iw_shape != [gp_slice.len(), fp_slice.len(), num_band] {
@@ -6514,9 +5686,7 @@ fn py_integration_weights_at_grid_points<'py>(
             "iw must have shape (num_grid_points, num_frequency_points, num_band)",
         ));
     }
-    let iw_slice = iw
-        .as_slice_mut()
-        .map_err(|_| PyValueError::new_err("iw must be C-contiguous"))?;
+    let iw_slice = c_slice_mut(&mut iw, "iw must be C-contiguous")?;
 
     py.detach(|| {
         let bzgrid = BzGridView {
@@ -6557,9 +5727,10 @@ fn py_tetrahedra_relative_grid_address<'py>(
     }
     let rec = mat3_f(&reciprocal_lattice)?;
     let (table, _main_diag_index) = tetrahedron_method::relative_grid_address(rec);
-    let out = relative_grid_address
-        .as_slice_mut()
-        .map_err(|_| PyValueError::new_err("relative_grid_address must be C-contiguous"))?;
+    let out = c_slice_mut(
+        &mut relative_grid_address,
+        "relative_grid_address must be C-contiguous",
+    )?;
     for i in 0..24 {
         for j in 0..4 {
             for k in 0..3 {
@@ -6605,17 +5776,9 @@ fn py_compute_permutation<'py>(
         lat[2][2],
     ];
 
-    let pos_view = positions.as_array();
-    let pos_slice = pos_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("positions must be C-contiguous"))?;
-    let rp_view = rotated_positions.as_array();
-    let rp_slice = rp_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("rotated_positions must be C-contiguous"))?;
-    let perm_slice = permutation
-        .as_slice_mut()
-        .map_err(|_| PyValueError::new_err("permutation must be C-contiguous"))?;
+    let pos_slice = c_slice(&positions, "positions must be C-contiguous")?;
+    let rp_slice = c_slice(&rotated_positions, "rotated_positions must be C-contiguous")?;
+    let perm_slice = c_slice_mut(&mut permutation, "permutation must be C-contiguous")?;
 
     let ok = py.detach(|| {
         cells::compute_permutation(perm_slice, &lat_flat, pos_slice, rp_slice, num_pos, symprec)
@@ -6640,9 +5803,7 @@ fn py_perm_trans_symmetrize_fc<'py>(
     if level < 0 {
         return Err(PyValueError::new_err("level must be non-negative"));
     }
-    let fc_slice = force_constants
-        .as_slice_mut()
-        .map_err(|_| PyValueError::new_err("force_constants must be C-contiguous"))?;
+    let fc_slice = c_slice_mut(&mut force_constants, "force_constants must be C-contiguous")?;
     py.detach(|| {
         fc2::perm_trans_symmetrize_fc(fc_slice, n_satom, level as usize);
     });
@@ -6702,25 +5863,11 @@ fn py_transpose_compact_fc<'py>(
         p2s_map.shape(),
         nsym_list.shape(),
     )?;
-    let perms_view = permutations.as_array();
-    let perms_slice = perms_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("permutations must be C-contiguous"))?;
-    let s2pp_view = s2pp_map.as_array();
-    let s2pp_slice = s2pp_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("s2pp_map must be C-contiguous"))?;
-    let p2s_view = p2s_map.as_array();
-    let p2s_slice = p2s_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("p2s_map must be C-contiguous"))?;
-    let nsym_view = nsym_list.as_array();
-    let nsym_slice = nsym_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("nsym_list must be C-contiguous"))?;
-    let fc_slice = force_constants
-        .as_slice_mut()
-        .map_err(|_| PyValueError::new_err("force_constants must be C-contiguous"))?;
+    let perms_slice = c_slice(&permutations, "permutations must be C-contiguous")?;
+    let s2pp_slice = c_slice(&s2pp_map, "s2pp_map must be C-contiguous")?;
+    let p2s_slice = c_slice(&p2s_map, "p2s_map must be C-contiguous")?;
+    let nsym_slice = c_slice(&nsym_list, "nsym_list must be C-contiguous")?;
+    let fc_slice = c_slice_mut(&mut force_constants, "force_constants must be C-contiguous")?;
     py.detach(|| {
         fc2::set_index_permutation_symmetry_compact_fc(
             fc_slice,
@@ -6788,33 +5935,16 @@ fn py_distribute_fc2<'py>(
     }
     let _ = fc_dim0;
 
-    let atom_view = atom_list.as_array();
-    let atom_slice = atom_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("atom_list must be C-contiguous"))?;
-    let fc_idx_view = fc_indices_of_atom_list.as_array();
-    let fc_idx_slice = fc_idx_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("fc_indices_of_atom_list must be C-contiguous"))?;
-    let r_view = rotations_cart.as_array();
-    let r_slice = r_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("rotations_cart must be C-contiguous"))?;
-    let perms_view = permutations.as_array();
-    let perms_slice = perms_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("permutations must be C-contiguous"))?;
-    let map_atoms_view = map_atoms.as_array();
-    let map_atoms_slice = map_atoms_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("map_atoms must be C-contiguous"))?;
-    let map_syms_view = map_syms.as_array();
-    let map_syms_slice = map_syms_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("map_syms must be C-contiguous"))?;
-    let fc_slice = force_constants
-        .as_slice_mut()
-        .map_err(|_| PyValueError::new_err("force_constants must be C-contiguous"))?;
+    let atom_slice = c_slice(&atom_list, "atom_list must be C-contiguous")?;
+    let fc_idx_slice = c_slice(
+        &fc_indices_of_atom_list,
+        "fc_indices_of_atom_list must be C-contiguous",
+    )?;
+    let r_slice = c_slice(&rotations_cart, "rotations_cart must be C-contiguous")?;
+    let perms_slice = c_slice(&permutations, "permutations must be C-contiguous")?;
+    let map_atoms_slice = c_slice(&map_atoms, "map_atoms must be C-contiguous")?;
+    let map_syms_slice = c_slice(&map_syms, "map_syms must be C-contiguous")?;
+    let fc_slice = c_slice_mut(&mut force_constants, "force_constants must be C-contiguous")?;
 
     py.detach(|| {
         fc2::distribute_fc2(
@@ -6852,25 +5982,11 @@ fn py_perm_trans_symmetrize_compact_fc<'py>(
     if level < 0 {
         return Err(PyValueError::new_err("level must be non-negative"));
     }
-    let perms_view = permutations.as_array();
-    let perms_slice = perms_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("permutations must be C-contiguous"))?;
-    let s2pp_view = s2pp_map.as_array();
-    let s2pp_slice = s2pp_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("s2pp_map must be C-contiguous"))?;
-    let p2s_view = p2s_map.as_array();
-    let p2s_slice = p2s_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("p2s_map must be C-contiguous"))?;
-    let nsym_view = nsym_list.as_array();
-    let nsym_slice = nsym_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("nsym_list must be C-contiguous"))?;
-    let fc_slice = force_constants
-        .as_slice_mut()
-        .map_err(|_| PyValueError::new_err("force_constants must be C-contiguous"))?;
+    let perms_slice = c_slice(&permutations, "permutations must be C-contiguous")?;
+    let s2pp_slice = c_slice(&s2pp_map, "s2pp_map must be C-contiguous")?;
+    let p2s_slice = c_slice(&p2s_map, "p2s_map must be C-contiguous")?;
+    let nsym_slice = c_slice(&nsym_list, "nsym_list must be C-contiguous")?;
+    let fc_slice = c_slice_mut(&mut force_constants, "force_constants must be C-contiguous")?;
     py.detach(|| {
         fc2::perm_trans_symmetrize_compact_fc(
             fc_slice,
@@ -6925,19 +6041,12 @@ fn py_eigvalsh_batch<'py>(
         ));
     }
 
-    let dynmats_view = dynmats.as_array();
-    let dynmats_flat = dynmats_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("dynmats must be C-contiguous"))?;
+    let dynmats_flat = c_slice(&dynmats, "dynmats must be C-contiguous")?;
     let dynmats_cmplx = complex_as_cmplx(dynmats_flat);
 
-    let evals_slice = eigenvalues
-        .as_slice_mut()
-        .map_err(|_| PyValueError::new_err("eigenvalues must be C-contiguous"))?;
+    let evals_slice = c_slice_mut(&mut eigenvalues, "eigenvalues must be C-contiguous")?;
 
-    let evecs_slice = eigvecs
-        .as_slice_mut()
-        .map_err(|_| PyValueError::new_err("eigvecs must be C-contiguous"))?;
+    let evecs_slice = c_slice_mut(&mut eigvecs, "eigvecs must be C-contiguous")?;
     let evecs_cmplx = complex_as_cmplx_mut(evecs_slice);
 
     py.detach(|| {
@@ -6978,15 +6087,10 @@ fn py_eigvalsh_values_batch<'py>(
         ));
     }
 
-    let dynmats_view = dynmats.as_array();
-    let dynmats_flat = dynmats_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("dynmats must be C-contiguous"))?;
+    let dynmats_flat = c_slice(&dynmats, "dynmats must be C-contiguous")?;
     let dynmats_cmplx = complex_as_cmplx(dynmats_flat);
 
-    let evals_slice = eigenvalues
-        .as_slice_mut()
-        .map_err(|_| PyValueError::new_err("eigenvalues must be C-contiguous"))?;
+    let evals_slice = c_slice_mut(&mut eigenvalues, "eigenvalues must be C-contiguous")?;
 
     py.detach(|| {
         diagonalize::eigvals_batch(dynmats_cmplx, evals_slice, num_band);
@@ -7143,24 +6247,14 @@ fn py_gsv_set_smallest_vectors_sparse<'py>(
     let reduced = _flatten_mat3_f(&reduced_basis)?;
     let trans = _flatten_mat3_i(&trans_mat)?;
 
-    let pos_to_view = pos_to.as_array();
-    let pos_to_slice = pos_to_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("pos_to must be C-contiguous"))?;
-    let pos_from_view = pos_from.as_array();
-    let pos_from_slice = pos_from_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("pos_from must be C-contiguous"))?;
-    let lp_view = lattice_points.as_array();
-    let lp_slice = lp_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("lattice_points must be C-contiguous"))?;
-    let svecs_slice = smallest_vectors
-        .as_slice_mut()
-        .map_err(|_| PyValueError::new_err("smallest_vectors must be C-contiguous"))?;
-    let mult_slice = multiplicity
-        .as_slice_mut()
-        .map_err(|_| PyValueError::new_err("multiplicity must be C-contiguous"))?;
+    let pos_to_slice = c_slice(&pos_to, "pos_to must be C-contiguous")?;
+    let pos_from_slice = c_slice(&pos_from, "pos_from must be C-contiguous")?;
+    let lp_slice = c_slice(&lattice_points, "lattice_points must be C-contiguous")?;
+    let svecs_slice = c_slice_mut(
+        &mut smallest_vectors,
+        "smallest_vectors must be C-contiguous",
+    )?;
+    let mult_slice = c_slice_mut(&mut multiplicity, "multiplicity must be C-contiguous")?;
 
     py.detach(|| {
         cells::set_smallest_vectors_sparse(
@@ -7226,24 +6320,14 @@ fn py_gsv_set_smallest_vectors_dense<'py>(
     let reduced = _flatten_mat3_f(&reduced_basis)?;
     let trans = _flatten_mat3_i(&trans_mat)?;
 
-    let pos_to_view = pos_to.as_array();
-    let pos_to_slice = pos_to_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("pos_to must be C-contiguous"))?;
-    let pos_from_view = pos_from.as_array();
-    let pos_from_slice = pos_from_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("pos_from must be C-contiguous"))?;
-    let lp_view = lattice_points.as_array();
-    let lp_slice = lp_view
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("lattice_points must be C-contiguous"))?;
-    let svecs_slice = smallest_vectors
-        .as_slice_mut()
-        .map_err(|_| PyValueError::new_err("smallest_vectors must be C-contiguous"))?;
-    let mult_slice = multiplicity
-        .as_slice_mut()
-        .map_err(|_| PyValueError::new_err("multiplicity must be C-contiguous"))?;
+    let pos_to_slice = c_slice(&pos_to, "pos_to must be C-contiguous")?;
+    let pos_from_slice = c_slice(&pos_from, "pos_from must be C-contiguous")?;
+    let lp_slice = c_slice(&lattice_points, "lattice_points must be C-contiguous")?;
+    let svecs_slice = c_slice_mut(
+        &mut smallest_vectors,
+        "smallest_vectors must be C-contiguous",
+    )?;
+    let mult_slice = c_slice_mut(&mut multiplicity, "multiplicity must be C-contiguous")?;
 
     py.detach(|| {
         cells::set_smallest_vectors_dense(

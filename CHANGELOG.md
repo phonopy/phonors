@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- A function given an array of two or more dimensions that is not in C
+  order raises `ValueError`.  Before, an array in Fortran order was
+  accepted and read or written in the wrong order.
+
 ## [0.8.0] - 2026-11-04
 
 ### Added
