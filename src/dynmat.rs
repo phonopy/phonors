@@ -638,7 +638,7 @@ fn d_dd_at_g(
 /// In-place Hermitian symmetrization: `mat <- (mat + mat^H) / 2`.
 /// Mirrors `make_Hermitian` in `c/dynmat.c`.  Diagonal entries lose
 /// their imaginary part (as they should for a Hermitian matrix).
-fn make_hermitian(mat: &mut [Cmplx], num_band: usize) {
+pub(crate) fn make_hermitian(mat: &mut [Cmplx], num_band: usize) {
     debug_assert_eq!(mat.len(), num_band * num_band);
     for i in 0..num_band {
         for j in i..num_band {
