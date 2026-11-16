@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `derivative_dynmats_at_qpoints` and
+  `derivative_dynmats_at_qpoints_gonze`, which compute the derivatives of
+  the dynamical matrices with respect to q at many q-points in parallel
+  over the q-points.  The first is for no NAC and the NAC of Wang, and
+  the second for the NAC of Gonze and Lee.
+
 ### Changed
 - A function given an array of two or more dimensions that is not in C
   order raises `ValueError`.  Before, an array in Fortran order was

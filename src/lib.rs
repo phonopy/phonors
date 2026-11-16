@@ -2269,6 +2269,302 @@ fn py_derivative_dynmat_at_q<'py>(
     Ok(())
 }
 
+/// Arrays shared by the wrappers of the derivatives of the dynamical
+/// matrices at many q-points, after the shape checks.
+struct DerivativeDynmatsInput<'a> {
+    qpoints: &'a [[f64; 3]],
+    fc: &'a [f64],
+    lattice: [[f64; 3]; 3],
+    reclat: [[f64; 3]; 3],
+    svecs: &'a [[f64; 3]],
+    multi: &'a [[i64; 2]],
+    mass: &'a [f64],
+    s2p_map: &'a [i64],
+    fc_row_map: &'a [i64],
+    num_patom: usize,
+    num_satom: usize,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn derivative_dynmats_input<'a>(
+    ddms_shape: &[usize],
+    qpoints: &'a PyReadonlyArray2<'_, f64>,
+    fc: &'a PyReadonlyArray4<'_, f64>,
+    lattice: &PyReadonlyArray2<'_, f64>,
+    reclat: &PyReadonlyArray2<'_, f64>,
+    svecs: &'a PyReadonlyArray2<'_, f64>,
+    multi: &'a PyReadonlyArray3<'_, i64>,
+    mass: &'a PyReadonlyArray1<'_, f64>,
+    s2p_map: &'a PyReadonlyArray1<'_, i64>,
+    fc_row_map: &'a PyReadonlyArray1<'_, i64>,
+) -> PyResult<DerivativeDynmatsInput<'a>> {
+    let n_q = qpoints.shape()[0];
+    if qpoints.shape() != [n_q, 3] {
+        return Err(PyValueError::new_err("qpoints must have shape (n_q, 3)"));
+    }
+    // The number of atoms is taken from fc_row_map, so that a wrong
+    // number of bands in ddms is reported as a wrong shape of ddms.
+    let num_patom = fc_row_map.shape()[0];
+    if num_patom == 0 {
+        return Err(PyValueError::new_err("fc_row_map must not be empty"));
+    }
+    let num_band = num_patom * 3;
+    if ddms_shape != [n_q, 3, num_band, num_band] {
+        return Err(PyValueError::new_err(
+            "ddms must have shape (n_q, 3, num_band, num_band), \
+             where num_band is 3 * len(fc_row_map)",
+        ));
+    }
+    let num_satom = s2p_map.shape()[0];
+    let fc_shape = fc.shape();
+    if fc_shape[1] != num_satom
+        || fc_shape[2] != 3
+        || fc_shape[3] != 3
+        || (fc_shape[0] != num_patom && fc_shape[0] != num_satom)
+    {
+        return Err(PyValueError::new_err(
+            "fc must have shape (num_patom or num_satom, num_satom, 3, 3)",
+        ));
+    }
+    if multi.shape() != [num_satom, num_patom, 2] {
+        return Err(PyValueError::new_err(
+            "multi must have shape (num_satom, num_patom, 2)",
+        ));
+    }
+    if mass.shape() != [num_patom] {
+        return Err(PyValueError::new_err("mass must have shape (num_patom,)"));
+    }
+    if svecs.shape()[1] != 3 {
+        return Err(PyValueError::new_err("svecs must have shape (n, 3)"));
+    }
+
+    Ok(DerivativeDynmatsInput {
+        qpoints: group_as_array(c_slice(qpoints, "qpoints must be C-contiguous")?),
+        fc: c_slice(fc, "fc must be C-contiguous")?,
+        lattice: mat3_f(lattice)?,
+        reclat: mat3_f(reclat)?,
+        svecs: group_as_array(c_slice(svecs, "svecs must be C-contiguous")?),
+        multi: group_as_array(c_slice(multi, "multi must be C-contiguous")?),
+        mass: c_slice(mass, "mass must be C-contiguous")?,
+        s2p_map: c_slice(s2p_map, "s2p_map must be C-contiguous")?,
+        fc_row_map: c_slice(fc_row_map, "fc_row_map must be C-contiguous")?,
+        num_patom,
+        num_satom,
+    })
+}
+
+fn optional_vec3(
+    array: Option<&PyReadonlyArray1<'_, f64>>,
+    message: &'static str,
+) -> PyResult<Option<[f64; 3]>> {
+    match array {
+        None => Ok(None),
+        Some(arr) => {
+            if arr.shape() != [3] {
+                return Err(PyValueError::new_err(message));
+            }
+            let v = arr.as_array();
+            Ok(Some([v[0], v[1], v[2]]))
+        }
+    }
+}
+
+/// Build the analytical derivatives of the dynamical matrices at many
+/// q-points in parallel over the q-points (Wang- or no-NAC path).
+///
+/// Writes into ``ddms`` (complex128, shape
+/// ``(n_q, 3, num_band, num_band)``); the second axis is the cartesian
+/// derivative direction.  ``ddms`` is overwritten, so it need not be
+/// zeroed.  ``qpoints`` is float64 with shape ``(n_q, 3)`` in reduced
+/// coordinates.  The other arguments are those of
+/// ``derivative_dynmat_at_q``.
+///
+/// Unlike ``derivative_dynmat_at_q``, the Wang-NAC terms are left out
+/// at a q-point at Gamma unless ``q_direction`` is given, and every
+/// element of each ``(num_band, num_band)`` matrix is Hermitian
+/// symmetrized.
+#[pyfunction]
+#[pyo3(name = "derivative_dynmats_at_qpoints")]
+#[pyo3(signature = (
+    ddms, qpoints, fc, lattice, reclat, svecs, multi, mass, s2p_map, fc_row_map,
+    born=None, dielectric=None, q_direction=None, nac_factor=0.0,
+))]
+#[allow(clippy::too_many_arguments)]
+fn py_derivative_dynmats_at_qpoints<'py>(
+    py: Python<'py>,
+    mut ddms: PyReadwriteArray4<'py, Complex64>,
+    qpoints: PyReadonlyArray2<'py, f64>,
+    fc: PyReadonlyArray4<'py, f64>,
+    lattice: PyReadonlyArray2<'py, f64>,
+    reclat: PyReadonlyArray2<'py, f64>,
+    svecs: PyReadonlyArray2<'py, f64>,
+    multi: PyReadonlyArray3<'py, i64>,
+    mass: PyReadonlyArray1<'py, f64>,
+    s2p_map: PyReadonlyArray1<'py, i64>,
+    fc_row_map: PyReadonlyArray1<'py, i64>,
+    born: Option<PyReadonlyArray3<'py, f64>>,
+    dielectric: Option<PyReadonlyArray2<'py, f64>>,
+    q_direction: Option<PyReadonlyArray1<'py, f64>>,
+    nac_factor: f64,
+) -> PyResult<()> {
+    let input = derivative_dynmats_input(
+        ddms.shape(),
+        &qpoints,
+        &fc,
+        &lattice,
+        &reclat,
+        &svecs,
+        &multi,
+        &mass,
+        &s2p_map,
+        &fc_row_map,
+    )?;
+
+    let nac = match born.as_ref() {
+        None => None,
+        Some(b) => {
+            let diel_arr = dielectric.as_ref().ok_or_else(|| {
+                PyValueError::new_err("dielectric must be provided when born is given")
+            })?;
+            if b.shape() != [input.num_patom, 3, 3] {
+                return Err(PyValueError::new_err(
+                    "born must have shape (num_patom, 3, 3)",
+                ));
+            }
+            Some(derivative_dynmat::DerivativeNacParams {
+                born: group_as_array_2d::<f64, 3, 3>(c_slice(b, "born must be C-contiguous")?),
+                dielectric: mat3_f(diel_arr)?,
+                q_direction: optional_vec3(
+                    q_direction.as_ref(),
+                    "q_direction must have shape (3,)",
+                )?,
+                nac_factor,
+            })
+        }
+    };
+
+    let ddms_slice = c_slice_mut(&mut ddms, "ddms must be C-contiguous")?;
+    let ddms_cmplx = complex_as_cmplx_mut(ddms_slice);
+
+    py.detach(|| {
+        derivative_dynmat::derivative_dynmats_at_qpoints(
+            ddms_cmplx,
+            input.qpoints,
+            input.fc,
+            &input.lattice,
+            &input.reclat,
+            input.svecs,
+            input.multi,
+            input.mass,
+            input.s2p_map,
+            input.fc_row_map,
+            nac.as_ref(),
+            input.num_patom,
+            input.num_satom,
+        );
+    });
+    Ok(())
+}
+
+/// Build the analytical derivatives of the dynamical matrices at many
+/// q-points in parallel over the q-points (Gonze-Lee NAC path).
+///
+/// ``fc`` are the short-range force constants.  At each q-point, the
+/// derivative of the reciprocal dipole-dipole sum, which is that of
+/// ``derivative_recip_dipole_dipole`` divided by ``sqrt(m_i m_j)``, is
+/// added to the derivative of the short-range part, and every element
+/// of each ``(num_band, num_band)`` matrix is Hermitian symmetrized.
+///
+/// ``pos`` (primitive-cell atom positions) and ``g_list`` are
+/// cartesian.  ``q_direction`` is in reduced coordinates and is used
+/// only at a q-point at Gamma, for the G = 0 term.  ``ddms``,
+/// ``qpoints`` and the remaining arguments are those of
+/// ``derivative_dynmats_at_qpoints``.
+#[pyfunction]
+#[pyo3(name = "derivative_dynmats_at_qpoints_gonze")]
+#[pyo3(signature = (
+    ddms, qpoints, fc, lattice, reclat, svecs, multi, mass, s2p_map, fc_row_map,
+    born, dielectric, pos, g_list, nac_factor, lambda_, q_direction=None,
+))]
+#[allow(clippy::too_many_arguments)]
+fn py_derivative_dynmats_at_qpoints_gonze<'py>(
+    py: Python<'py>,
+    mut ddms: PyReadwriteArray4<'py, Complex64>,
+    qpoints: PyReadonlyArray2<'py, f64>,
+    fc: PyReadonlyArray4<'py, f64>,
+    lattice: PyReadonlyArray2<'py, f64>,
+    reclat: PyReadonlyArray2<'py, f64>,
+    svecs: PyReadonlyArray2<'py, f64>,
+    multi: PyReadonlyArray3<'py, i64>,
+    mass: PyReadonlyArray1<'py, f64>,
+    s2p_map: PyReadonlyArray1<'py, i64>,
+    fc_row_map: PyReadonlyArray1<'py, i64>,
+    born: PyReadonlyArray3<'py, f64>,
+    dielectric: PyReadonlyArray2<'py, f64>,
+    pos: PyReadonlyArray2<'py, f64>,
+    g_list: PyReadonlyArray2<'py, f64>,
+    nac_factor: f64,
+    lambda_: f64,
+    q_direction: Option<PyReadonlyArray1<'py, f64>>,
+) -> PyResult<()> {
+    let input = derivative_dynmats_input(
+        ddms.shape(),
+        &qpoints,
+        &fc,
+        &lattice,
+        &reclat,
+        &svecs,
+        &multi,
+        &mass,
+        &s2p_map,
+        &fc_row_map,
+    )?;
+
+    if born.shape() != [input.num_patom, 3, 3] {
+        return Err(PyValueError::new_err(
+            "born must have shape (num_patom, 3, 3)",
+        ));
+    }
+    if pos.shape() != [input.num_patom, 3] {
+        return Err(PyValueError::new_err("pos must have shape (num_patom, 3)"));
+    }
+    if g_list.shape()[1] != 3 {
+        return Err(PyValueError::new_err("g_list must have shape (num_g, 3)"));
+    }
+
+    let gonze = derivative_dynmat::DerivativeGonzeParams {
+        born: group_as_array_2d::<f64, 3, 3>(c_slice(&born, "born must be C-contiguous")?),
+        dielectric: mat3_f(&dielectric)?,
+        q_direction: optional_vec3(q_direction.as_ref(), "q_direction must have shape (3,)")?,
+        nac_factor,
+        pos: group_as_array(c_slice(&pos, "pos must be C-contiguous")?),
+        g_list: group_as_array(c_slice(&g_list, "g_list must be C-contiguous")?),
+        lambda: lambda_,
+    };
+
+    let ddms_slice = c_slice_mut(&mut ddms, "ddms must be C-contiguous")?;
+    let ddms_cmplx = complex_as_cmplx_mut(ddms_slice);
+
+    py.detach(|| {
+        derivative_dynmat::derivative_dynmats_at_qpoints_gonze(
+            ddms_cmplx,
+            input.qpoints,
+            input.fc,
+            &input.lattice,
+            &input.reclat,
+            input.svecs,
+            input.multi,
+            input.mass,
+            input.s2p_map,
+            input.fc_row_map,
+            &gonze,
+            input.num_patom,
+            input.num_satom,
+        );
+    });
+    Ok(())
+}
+
 /// Transform dynamical matrices at commensurate q-points back to real-
 /// space force constants.
 ///
@@ -6145,6 +6441,8 @@ fn phonors(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_eigvalsh_values_batch, m)?)?;
     m.add_function(wrap_pyfunction!(py_transform_dynmat_to_fc, m)?)?;
     m.add_function(wrap_pyfunction!(py_derivative_dynmat_at_q, m)?)?;
+    m.add_function(wrap_pyfunction!(py_derivative_dynmats_at_qpoints, m)?)?;
+    m.add_function(wrap_pyfunction!(py_derivative_dynmats_at_qpoints_gonze, m)?)?;
     m.add_function(wrap_pyfunction!(py_real_to_reciprocal, m)?)?;
     m.add_function(wrap_pyfunction!(py_reciprocal_to_normal_squared, m)?)?;
     m.add_function(wrap_pyfunction!(py_imag_self_energy_with_g, m)?)?;
