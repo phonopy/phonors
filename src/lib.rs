@@ -2302,18 +2302,19 @@ fn derivative_dynmats_input<'a>(
     if qpoints.shape() != [n_q, 3] {
         return Err(PyValueError::new_err("qpoints must have shape (n_q, 3)"));
     }
-    let num_band = ddms_shape[2];
+    // The number of atoms is taken from fc_row_map, so that a wrong
+    // number of bands in ddms is reported as a wrong shape of ddms.
+    let num_patom = fc_row_map.shape()[0];
+    if num_patom == 0 {
+        return Err(PyValueError::new_err("fc_row_map must not be empty"));
+    }
+    let num_band = num_patom * 3;
     if ddms_shape != [n_q, 3, num_band, num_band] {
         return Err(PyValueError::new_err(
-            "ddms must have shape (n_q, 3, num_band, num_band)",
+            "ddms must have shape (n_q, 3, num_band, num_band), \
+             where num_band is 3 * len(fc_row_map)",
         ));
     }
-    if num_band == 0 || num_band % 3 != 0 {
-        return Err(PyValueError::new_err(
-            "num_band must be a positive multiple of 3",
-        ));
-    }
-    let num_patom = num_band / 3;
     let num_satom = s2p_map.shape()[0];
     let fc_shape = fc.shape();
     if fc_shape[1] != num_satom
@@ -2332,11 +2333,6 @@ fn derivative_dynmats_input<'a>(
     }
     if mass.shape() != [num_patom] {
         return Err(PyValueError::new_err("mass must have shape (num_patom,)"));
-    }
-    if fc_row_map.shape() != [num_patom] {
-        return Err(PyValueError::new_err(
-            "fc_row_map must have shape (num_patom,)",
-        ));
     }
     if svecs.shape()[1] != 3 {
         return Err(PyValueError::new_err("svecs must have shape (n, 3)"));
